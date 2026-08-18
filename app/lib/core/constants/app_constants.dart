@@ -129,9 +129,9 @@ abstract final class AppConstants {
 
   static const String defaultPhotoAttestationModule = 'photo_attestation';
   static const String defaultPhotoAttestationPackageId =
-      '0x2cc255055be3f23c13021f335ee141d15f1dd9f9b8febd819f30ac76796b569e';
+      '0xf4b83a02ad29b78266f8b1a39f5b533bde6bd5ef00eb434db46c3f7be29639db';
   static const String defaultPhotoAttestationRegistryId =
-      '0xab1bf31ba2754b488f5c2b7abd1c20ef874f66fb8712778c13b2ac8c1f6b6821';
+      '0xde8b9f476c91dbdb05238c656a6ea3aa9f670e3b732e3e5d48628f5d2b66122d';
   static const double minimumAttestationSuiBalance = 0.004;
   static const int minimumAttestationMistBalance = 4000000;
   static const int maximumAttestationTimeGapMinutes = 15;
