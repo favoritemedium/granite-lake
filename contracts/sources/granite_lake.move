@@ -13,7 +13,12 @@ module granite_lake::photo_attestation {
     const E_USER_DISABLED: u64 = 6;
     const E_USER_NOT_FOUND: u64 = 7;
 
-    public struct OwnerCap has key {
+    // `store` lets OwnerCap move via sui::transfer::public_transfer, Sui's
+    // standard object-transfer path (the same reason the Sui framework's own
+    // UpgradeCap has `key, store`) - so ownership can be handed off directly
+    // by whoever holds the cap, without this module exposing a bespoke
+    // transfer function.
+    public struct OwnerCap has key, store {
         id: UID,
     }
 
@@ -56,12 +61,16 @@ module granite_lake::photo_attestation {
         user_wallet: address,
     }
 
+    // Carries domain so the verifier can read attribution straight from the
+    // event instead of reconstructing it from whichever capability the
+    // attesting wallet currently happens to hold (see F-05).
     public struct PhotoAttested has copy, drop {
         photo_hash: vector<u8>,
         gps: vector<u8>,
         altitude: vector<u8>,
         project_id: vector<u8>,
         user_wallet: address,
+        domain: vector<u8>,
     }
 
     public struct FileAttested has copy, drop {
@@ -69,6 +78,15 @@ module granite_lake::photo_attestation {
         user_wallet: address,
         file_id: vector<u8>,
         project_id: vector<u8>,
+        domain: vector<u8>,
+    }
+
+    // Emitted by set_domain_admin so a key rotation is auditable the same
+    // way every other administrative mutation in this module is (see F-11).
+    public struct DomainAdminChanged has copy, drop {
+        domain: vector<u8>,
+        old_admin_wallet: address,
+        new_admin_wallet: address,
     }
 
     fun init(ctx: &mut TxContext) {
@@ -104,6 +122,30 @@ module granite_lake::photo_attestation {
         event::emit(DomainAdded {
             domain,
             admin_wallet,
+        });
+    }
+
+    // Rotates a domain's administrator wallet. Gated on OwnerCap rather than
+    // the domain's own admin_wallet: if the admin key is the thing that was
+    // compromised, requiring its own signature to replace itself would defeat
+    // the purpose. Without this, a compromised or lost admin key was
+    // permanent and unrecoverable (see F-11).
+    public entry fun set_domain_admin(
+        _: &OwnerCap,
+        registry: &mut Registry,
+        domain: vector<u8>,
+        new_admin_wallet: address,
+    ) {
+        assert!(table::contains(&registry.domains, copy domain), E_DOMAIN_NOT_FOUND);
+
+        let domain_record = table::borrow_mut(&mut registry.domains, copy domain);
+        let old_admin_wallet = domain_record.admin_wallet;
+        domain_record.admin_wallet = new_admin_wallet;
+
+        event::emit(DomainAdminChanged {
+            domain,
+            old_admin_wallet,
+            new_admin_wallet,
         });
     }
 
@@ -202,6 +244,7 @@ module granite_lake::photo_attestation {
             altitude,
             project_id,
             user_wallet: sender,
+            domain: user_cap.domain,
         });
     }
 
@@ -223,6 +266,7 @@ module granite_lake::photo_attestation {
             user_wallet: sender,
             file_id,
             project_id,
+            domain: user_cap.domain,
         });
     }
 

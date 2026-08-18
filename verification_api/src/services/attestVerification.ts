@@ -451,44 +451,24 @@ function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-async function getUserCapInfo(
-  userWallet: string,
-  rpcUrl: string
-): Promise<{ domain: string | null; userCapObjectId: string | null }> {
+// Only the object id, for display purposes - domain attribution is read
+// from the attestation event itself, never from this (see F-05).
+async function getUserCapObjectId(userWallet: string, rpcUrl: string): Promise<string | null> {
   for (const structType of [USER_CAP_TYPE, USER_CAP_TYPE_ORIGINAL]) {
     const owned = await suiRpcCall<OwnedObjectsResult>(
       "suix_getOwnedObjects",
-      [
-        userWallet,
-        {
-          filter: { StructType: structType },
-          options: { showContent: true },
-        },
-        null,
-        10,
-      ],
+      [userWallet, { filter: { StructType: structType }, options: { showContent: true } }, null, 10],
       rpcUrl
     );
 
     for (const item of owned.data ?? []) {
-      const fields = item.data?.content?.fields;
-      if (!fields) continue;
-
-      const domain = decodeVector(fields.domain).decoded;
-      const userCapObjectId = item.data?.objectId ?? null;
-      if (domain) {
-        return {
-          domain,
-          userCapObjectId,
-        };
+      if (item.data?.content?.fields && item.data.objectId) {
+        return item.data.objectId;
       }
     }
   }
 
-  return {
-    domain: null,
-    userCapObjectId: null,
-  };
+  return null;
 }
 
 // The Registry's `domains` field is a Move Table, which stores its entries
@@ -763,27 +743,32 @@ export async function verifyAttestationHashDetailed(
 
   // Cache domain/admin-wallet lookups per wallet: several matched events can
   // share the same attester (retries, re-attestation), and each lookup is a
-  // full on-chain scan.
-  const domainByWallet = new Map<
-    string,
-    { domain: string | null; domainAdminWallet: string | null; userCapObjectId: string | null }
-  >();
+  // full on-chain scan. domainAdminWallet is cached by domain rather than
+  // wallet, since domain now comes straight off each event (see F-05) and
+  // must never be overwritten by a value cached under a different event.
+  const domainAdminWalletByDomain = new Map<string, Promise<string | null>>();
 
-  async function resolveDomain(
-    userWallet: string
-  ): Promise<{ domain: string | null; domainAdminWallet: string | null; userCapObjectId: string | null }> {
-    const cached = domainByWallet.get(userWallet.toLowerCase());
-    if (cached) return cached;
+  function resolveDomainAdminWallet(domain: string | null): Promise<string | null> {
+    if (!domain) return Promise.resolve(null);
+    const key = domain.toLowerCase();
+    let cached = domainAdminWalletByDomain.get(key);
+    if (!cached) {
+      cached = getDomainAdminWallet(domain, rpcUrl);
+      domainAdminWalletByDomain.set(key, cached);
+    }
+    return cached;
+  }
 
-    const userCapInfo = await getUserCapInfo(userWallet, rpcUrl);
-    const domainAdminWallet = await getDomainAdminWallet(userCapInfo.domain, rpcUrl);
-    const resolved = {
-      domain: userCapInfo.domain,
-      domainAdminWallet,
-      userCapObjectId: userCapInfo.userCapObjectId,
-    };
-    domainByWallet.set(userWallet.toLowerCase(), resolved);
-    return resolved;
+  const userCapObjectIdByWallet = new Map<string, Promise<string | null>>();
+
+  function resolveUserCapObjectId(userWallet: string): Promise<string | null> {
+    const key = userWallet.toLowerCase();
+    let cached = userCapObjectIdByWallet.get(key);
+    if (!cached) {
+      cached = getUserCapObjectId(userWallet, rpcUrl);
+      userCapObjectIdByWallet.set(key, cached);
+    }
+    return cached;
   }
 
   const records: AttestationRecord[] = [];
@@ -796,7 +781,13 @@ export async function verifyAttestationHashDetailed(
     const userWallet = safeAddress(parsed.user_wallet);
     if (!userWallet) continue;
 
-    const { domain, domainAdminWallet, userCapObjectId } = await resolveDomain(userWallet);
+    // Attribution comes straight from the event, never from whichever
+    // capability the wallet currently happens to hold (see F-05).
+    const domain = decodeVector(parsed.domain).decoded || null;
+    const [domainAdminWallet, userCapObjectId] = await Promise.all([
+      resolveDomainAdminWallet(domain),
+      resolveUserCapObjectId(userWallet),
+    ]);
     const userEnabledAtAttestation = await getEnabledAtAttestation({
       userWallet,
       domain,
@@ -868,9 +859,23 @@ export async function getAttestationsByWallet(
   let pagesScanned = 0;
   let eventsScanned = 0;
 
-  const userCapInfo = await getUserCapInfo(walletAddress, rpcUrl);
-  const domain = userCapInfo.domain;
-  const domainAdminWallet = await getDomainAdminWallet(domain, rpcUrl);
+  const userCapObjectId = await getUserCapObjectId(walletAddress, rpcUrl);
+
+  // Cached by domain, not by wallet: domain comes off each event
+  // individually (see F-05), so a wallet whose attestations span more than
+  // one domain must not have every record collapsed onto a single answer.
+  const domainAdminWalletByDomain = new Map<string, Promise<string | null>>();
+
+  function resolveDomainAdminWallet(domain: string | null): Promise<string | null> {
+    if (!domain) return Promise.resolve(null);
+    const key = domain.toLowerCase();
+    let cached = domainAdminWalletByDomain.get(key);
+    if (!cached) {
+      cached = getDomainAdminWallet(domain, rpcUrl);
+      domainAdminWalletByDomain.set(key, cached);
+    }
+    return cached;
+  }
 
   const allowedPackageIds = new Set([
     GRANITE_LAKE_PACKAGE_ID.toLowerCase(),
@@ -912,6 +917,11 @@ export async function getAttestationsByWallet(
           const eventWallet = safeAddress(parsed.user_wallet).toLowerCase();
           if (eventWallet !== targetWallet) continue;
 
+          // Attribution comes straight from the event, never from whichever
+          // capability the wallet currently happens to hold (see F-05).
+          const domain = decodeVector(parsed.domain).decoded || null;
+          const domainAdminWallet = await resolveDomainAdminWallet(domain);
+
           const eventHash = decodePhotoHash(parsed[group.hashField]);
           const gps = group.attestType === "attest_photo" ? decodeVector(parsed.gps) : null;
           const altitude = group.attestType === "attest_photo" ? decodeVector(parsed.altitude) : null;
@@ -931,7 +941,7 @@ export async function getAttestationsByWallet(
             packageId: event.packageId,
             eventTimestampMs: event.timestampMs ?? null,
             checkpointTimeIso: event.timestampMs ? new Date(Number(event.timestampMs)).toISOString() : null,
-            userCapObjectId: userCapInfo.userCapObjectId,
+            userCapObjectId,
             hashHex: eventHash,
             ...(group.attestType === "attest_photo"
               ? {

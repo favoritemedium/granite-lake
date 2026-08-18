@@ -5,8 +5,6 @@ import {
   GRANITE_LAKE_REGISTRY_ID,
   PHOTO_ATTESTED_EVENT_TYPES,
   SUI_RPC_URL,
-  USER_CAP_TYPE,
-  USER_CAP_TYPE_ORIGINAL,
   USER_DISABLED_EVENT_TYPES,
   USER_ENABLED_EVENT_TYPES,
 } from "../constants";
@@ -30,18 +28,6 @@ type SuiEventPage = {
   data?: SuiEvent[];
   hasNextPage?: boolean;
   nextCursor?: SuiEventCursor | null;
-};
-
-type OwnedObjectContent = {
-  dataType?: string;
-  type?: string;
-  fields?: Record<string, unknown>;
-};
-
-type OwnedObjectResponse = {
-  data?: {
-    content?: OwnedObjectContent;
-  };
 };
 
 type SuiRpcError = {
@@ -363,36 +349,6 @@ function normalizeGraphQlUrl(url: string): string {
 
 function buildGraphQlRequest(method: string, params: unknown[]): { query: string; variables: Record<string, unknown> } {
   switch (method) {
-    case "suix_getOwnedObjects": {
-      const [ownerAddress, queryOptions, cursor, limit] = params as [
-        string,
-        { filter?: { StructType?: string } },
-        string | null,
-        number | undefined,
-      ];
-      return {
-        query: `query($address:SuiAddress!,$type:String!,$first:Int!,$after:String){
-          address(address:$address){
-            objects(first:$first, after:$after, filter:{ type:$type }){
-              pageInfo { hasNextPage endCursor }
-              nodes {
-                address
-                contents {
-                  type { repr }
-                  json
-                }
-              }
-            }
-          }
-        }`,
-        variables: {
-          address: ownerAddress,
-          type: queryOptions?.filter?.StructType ?? "",
-          first: typeof limit === "number" ? limit : 50,
-          after: cursor,
-        },
-      };
-    }
     case "suix_queryEvents": {
       const [filter, cursor, limit] = params as [
         { MoveEventType?: string },
@@ -470,8 +426,6 @@ function buildGraphQlRequest(method: string, params: unknown[]): { query: string
 
 function extractGraphQlResult<T>(method: string, data: Record<string, unknown>): T {
   switch (method) {
-    case "suix_getOwnedObjects":
-      return mapOwnedObjectsGraphQlResult(data) as T;
     case "suix_queryEvents":
       return mapEventsGraphQlResult(data) as T;
     case "sui_getObject":
@@ -496,25 +450,6 @@ function mapDynamicFieldGraphQlResult(data: Record<string, unknown>): { json: un
   const dynamicField = asRecord(address?.dynamicField);
   const value = asRecord(dynamicField?.value);
   return { json: value?.json ?? null };
-}
-
-function mapOwnedObjectsGraphQlResult(data: Record<string, unknown>): { data?: OwnedObjectResponse[] } {
-  const address = asRecord(data.address);
-  const objects = asRecord(address?.objects);
-  const nodes = asArray(objects?.nodes);
-  return {
-    data: nodes.map((node) => {
-      const entry = asRecord(node);
-      const contents = asRecord(entry?.contents);
-      return {
-        data: {
-          content: {
-            fields: asRecord(contents?.json) ?? undefined,
-          },
-        },
-      };
-    }),
-  };
 }
 
 function mapEventsGraphQlResult(data: Record<string, unknown>): SuiEventPage {
@@ -577,39 +512,6 @@ function asArray(value: unknown): unknown[] {
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
-}
-
-async function getDomainFromUserCap(userWallet: string): Promise<string | null> {
-  const attempts = [USER_CAP_TYPE, USER_CAP_TYPE_ORIGINAL];
-
-  for (const structType of attempts) {
-    const owned = await suiRpcCall<{ data?: OwnedObjectResponse[] }>("suix_getOwnedObjects", [
-      userWallet,
-      {
-        filter: {
-          StructType: structType,
-        },
-        options: {
-          showContent: true,
-        },
-      },
-      null,
-      10,
-    ]);
-
-    const first = owned.data?.[0]?.data?.content;
-    const fields = first?.fields;
-    if (!fields) {
-      continue;
-    }
-
-    const domain = decodeVector(fields.domain).decoded;
-    if (domain) {
-      return domain;
-    }
-  }
-
-  return null;
 }
 
 // The Registry's `domains` field is a Move Table, which stores its entries
@@ -1039,11 +941,27 @@ export async function getWalletAttestationsByWallet(options: {
     };
   }
 
-  const domain = await getDomainFromUserCap(wallet);
-  const domainAdminWallet = await getDomainAdminWallet(domain);
+  // Cached by domain, not by wallet: domain comes off each event
+  // individually (see F-05), so a wallet whose attestations span more than
+  // one domain must not have every record collapsed onto a single answer.
+  const domainAdminWalletByDomain = new Map<string, Promise<string | null>>();
+  function resolveDomainAdminWallet(domain: string | null): Promise<string | null> {
+    if (!domain) return Promise.resolve(null);
+    const key = domain.toLowerCase();
+    let cached = domainAdminWalletByDomain.get(key);
+    if (!cached) {
+      cached = getDomainAdminWallet(domain);
+      domainAdminWalletByDomain.set(key, cached);
+    }
+    return cached;
+  }
 
   const events: WalletAttestationRecord[] = [];
   for (const item of collected) {
+    // Attribution comes straight from the event, never from whichever
+    // capability the wallet currently happens to hold (see F-05).
+    const domain = decodeVector(item.event.parsedJson?.domain).decoded || null;
+    const domainAdminWallet = await resolveDomainAdminWallet(domain);
     const enabled = await getEnabledAtAttestation({
       userWallet: wallet,
       domain,
@@ -1072,19 +990,21 @@ export async function getWalletAttestationsByWallet(options: {
   };
 }
 
-async function resolveDomainCached(
-  userWallet: string,
-  cache: Map<string, { domain: string | null; domainAdminWallet: string | null }>
-): Promise<{ domain: string | null; domainAdminWallet: string | null }> {
-  const key = normalizeWalletAddress(userWallet);
-  const cached = cache.get(key);
-  if (cached) return cached;
-
-  const domain = await getDomainFromUserCap(userWallet);
-  const domainAdminWallet = await getDomainAdminWallet(domain);
-  const resolved = { domain, domainAdminWallet };
-  cache.set(key, resolved);
-  return resolved;
+// Cached by domain, not by wallet: domain comes off each event individually
+// (see F-05), so two attestations from the same wallet across different
+// domains must not have one's admin wallet answer bleed into the other's.
+function resolveDomainAdminWalletCached(
+  domain: string | null,
+  cache: Map<string, Promise<string | null>>
+): Promise<string | null> {
+  if (!domain) return Promise.resolve(null);
+  const key = domain.toLowerCase();
+  let cached = cache.get(key);
+  if (!cached) {
+    cached = getDomainAdminWallet(domain);
+    cache.set(key, cached);
+  }
+  return cached;
 }
 
 export async function verifyPhotoHash(options: {
@@ -1145,14 +1065,17 @@ export async function verifyPhotoHash(options: {
     };
   }
 
-  const domainCache = new Map<string, { domain: string | null; domainAdminWallet: string | null }>();
+  const domainAdminWalletCache = new Map<string, Promise<string | null>>();
   const records: PhotoAttestationRecord[] = [];
 
   for (const event of matchedEvents) {
     const userWallet = safeAddress(event.parsedJson?.user_wallet);
     if (!userWallet) continue;
 
-    const { domain, domainAdminWallet } = await resolveDomainCached(userWallet, domainCache);
+    // Attribution comes straight from the event, never from whichever
+    // capability the wallet currently happens to hold (see F-05).
+    const domain = decodeVector(event.parsedJson?.domain).decoded || null;
+    const domainAdminWallet = await resolveDomainAdminWalletCached(domain, domainAdminWalletCache);
     const enabled = await getEnabledAtAttestation({
       userWallet,
       domain,
@@ -1248,14 +1171,17 @@ export async function verifyFileHash(options: {
     };
   }
 
-  const domainCache = new Map<string, { domain: string | null; domainAdminWallet: string | null }>();
+  const domainAdminWalletCache = new Map<string, Promise<string | null>>();
   const records: FileAttestationRecord[] = [];
 
   for (const event of matchedEvents) {
     const userWallet = safeAddress(event.parsedJson?.user_wallet);
     if (!userWallet) continue;
 
-    const { domain, domainAdminWallet } = await resolveDomainCached(userWallet, domainCache);
+    // Attribution comes straight from the event, never from whichever
+    // capability the wallet currently happens to hold (see F-05).
+    const domain = decodeVector(event.parsedJson?.domain).decoded || null;
+    const domainAdminWallet = await resolveDomainAdminWalletCached(domain, domainAdminWalletCache);
     const enabled = await getEnabledAtAttestation({
       userWallet,
       domain,
