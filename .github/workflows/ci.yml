@@ -91,13 +91,17 @@ jobs:
   move-test:
     name: Move contract tests
     runs-on: ubuntu-latest
+    env:
+      SUI_RELEASE_TAG: testnet-v1.78.1
     steps:
       - uses: actions/checkout@v4
-      - name: Install Sui toolchain (suiup)
+      - name: Install Sui CLI
         run: |
-          curl -sSfL https://raw.githubusercontent.com/MystenLabs/suiup/main/install.sh | sh
+          curl -sSfL -o sui.tgz \
+            "https://github.com/MystenLabs/sui/releases/download/${SUI_RELEASE_TAG}/sui-${SUI_RELEASE_TAG}-ubuntu-x86_64.tgz"
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf sui.tgz -C "$HOME/.local/bin" ./sui
+          rm sui.tgz
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Install sui@testnet via suiup
-        run: suiup install sui@testnet
       - working-directory: contracts
         run: sui move test
