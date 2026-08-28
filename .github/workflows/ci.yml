@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-format:
+    name: Lint & format (root, server, verification)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run format:prettier:check
+      - run: npm run lint:server
+      - run: npm run lint:verification
+
+  test-server:
+    name: Build & test server
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
+  build-verification-api:
+    name: Build verification_api
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: verification_api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: verification_api/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  build-verification-portal:
+    name: Build verification_portal
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: verification_portal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: verification_portal/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  flutter-analyze:
+    name: Analyze & format Flutter app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.38.5"
+          channel: stable
+      - working-directory: app
+        run: flutter pub get
+      - run: npm run format:app:check
+      - run: npm run lint:app
+
+  move-test:
+    name: Move contract tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Sui toolchain (suiup)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/MystenLabs/suiup/main/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install sui@testnet via suiup
+        run: suiup install sui@testnet
+      - working-directory: contracts
+        run: sui move test
