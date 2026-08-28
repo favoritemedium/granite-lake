@@ -1,20 +1,19 @@
 # Default reviewers for Granite Lake
-# Adjust team names to match your GitHub organization.
 
 # Granular paths
-/app/                  @favoritemedium/granite-lake-app-maintainers
-/server/               @favoritemedium/granite-lake-server-maintainers
-/contracts/            @favoritemedium/granite-lake-contracts-maintainers
-/verification_api/     @favoritemedium/granite-lake-server-maintainers
-/verification_portal/  @favoritemedium/granite-lake-app-maintainers
+/app/                  @favoritemedium/granite-maintainers
+/server/               @favoritemedium/granite-maintainers
+/contracts/            @favoritemedium/granite-maintainers
+/verification_api/     @favoritemedium/granite-maintainers
+/verification_portal/  @favoritemedium/granite-maintainers
 
 # Shared files in this repository
-/.github/              @favoritemedium/granite-lake-server-maintainers
-/README.md             @favoritemedium/granite-lake-server-maintainers
-/CHANGELOG.md          @favoritemedium/granite-lake-server-maintainers
-/SECURITY.md           @favoritemedium/granite-lake-server-maintainers
-/CONTRIBUTING.md       @favoritemedium/granite-lake-server-maintainers
-/LICENSE               @favoritemedium/granite-lake-server-maintainers
+/.github/              @favoritemedium/granite-maintainers
+/README.md             @favoritemedium/granite-maintainers
+/CHANGELOG.md          @favoritemedium/granite-maintainers
+/SECURITY.md           @favoritemedium/granite-maintainers
+/CONTRIBUTING.md       @favoritemedium/granite-maintainers
+/LICENSE               @favoritemedium/granite-maintainers
 
 # Fallback for everything else
-*                      @favoritemedium/granite-lake-server-maintainers
+*                      @favoritemedium/granite-maintainers
