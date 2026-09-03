@@ -416,6 +416,10 @@ class _LabeledField extends StatelessWidget {
           decoration: InputDecoration(
             hintText: hintText,
             errorText: errorText,
+            // Flutter truncates errorText to a single ellipsized line unless
+            // errorMaxLines is set explicitly, even though the field grows
+            // to fit it. These messages can run several sentences.
+            errorMaxLines: 6,
             errorStyle: AppTextStyles.labelSmall.copyWith(
               color: AppColors.statusError,
               letterSpacing: 0.8,

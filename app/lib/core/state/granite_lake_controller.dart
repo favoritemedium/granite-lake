@@ -231,7 +231,10 @@ class GraniteLakeController extends ChangeNotifier {
     } on PhotoAttestationException catch (error) {
       return SecureOperationResult.failure(error.userMessage);
     } catch (error) {
-      return SecureOperationResult.failure('OTP request failed: $error');
+      debugPrint('[OTP] requestPhotoAttestationOtp unexpected error: $error');
+      return const SecureOperationResult.failure(
+        'Something went wrong while requesting the OTP. Please try again.',
+      );
     }
   }
 
@@ -324,7 +327,10 @@ class GraniteLakeController extends ChangeNotifier {
     } on PhotoAttestationException catch (error) {
       return ActionResult.failure(error.userMessage);
     } catch (error) {
-      return ActionResult.failure('User claim failed: $error');
+      debugPrint('[OTP] claimPhotoAttestationUser unexpected error: $error');
+      return const ActionResult.failure(
+        'Something went wrong while verifying your OTP. Please try again.',
+      );
     } finally {
       if (!hadActiveSessionBeforeClaim) {
         await endSession();

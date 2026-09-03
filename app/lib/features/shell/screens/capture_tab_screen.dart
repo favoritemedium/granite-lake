@@ -10,6 +10,7 @@ import '../../../core/router/app_router.dart';
 import '../../../core/state/granite_lake_controller.dart';
 import '../../../core/theme/app_colors.dart';
 import '../../../core/theme/app_text_styles.dart';
+import '../../../core/utils/location_settings.dart';
 
 /// The Capture tab body shown inside [MainShell].
 ///
@@ -24,22 +25,52 @@ class CaptureTabScreen extends StatefulWidget {
 }
 
 class _CaptureTabScreenState extends State<CaptureTabScreen>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   bool _isStartingSession = false;
   bool _isEndingSession = false;
   String? _errorMessage;
   AnimationController? _pulseController;
   String _locationLabel = 'Locating...';
+  // _refreshLocation() previously ran exactly once, in initState. If the
+  // system Location toggle (Settings > Location - separate from this app's
+  // own Location permission) got switched off after that, or a fix just
+  // never arrived (no timeLimit was set), the label went stale forever:
+  // nothing re-ran the check, so a changed state never had a chance to show.
+  // A periodic timer plus a resume listener make sure it's re-checked.
+  Timer? _locationTimer;
+  int _locationRequestId = 0;
+  // On GrapheneOS without Sandboxed Google Play, a GPS-only cold fix is
+  // confirmed by GrapheneOS's own team to normally take 2-5+ minutes
+  // outdoors (https://discuss.grapheneos.org/d/79-location-not-working).
+  // Firing a fresh _refreshLocation every 15s while one is still in flight
+  // would restart that request from scratch each time, so skip relaunching
+  // it until the current attempt actually finishes.
+  bool _isFetchingLocation = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _ensurePulseController();
     unawaited(_refreshLocation());
+    _locationTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      unawaited(_refreshLocation());
+    });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      // Catches the common case immediately: user backgrounds the app,
+      // flips Location in system Settings, comes back.
+      unawaited(_refreshLocation());
+    }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _locationTimer?.cancel();
     _pulseController?.dispose();
     super.dispose();
   }
@@ -198,16 +229,26 @@ class _CaptureTabScreenState extends State<CaptureTabScreen>
   }
 
   Future<void> _refreshLocation() async {
+    if (_isFetchingLocation) {
+      return;
+    }
+    // Guards against the periodic timer, the resume listener, and initState
+    // firing overlapping calls: a slow/late call from an earlier trigger
+    // must not clobber the state set by a newer one.
+    final requestId = ++_locationRequestId;
+    bool isCurrent() => mounted && requestId == _locationRequestId;
+    _isFetchingLocation = true;
+
     try {
-      if (mounted) {
+      if (isCurrent()) {
         setState(() => _locationLabel = 'Locating...');
       }
 
       final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!isCurrent()) {
+        return;
+      }
       if (!serviceEnabled) {
-        if (!mounted) {
-          return;
-        }
         setState(() => _locationLabel = 'Location off');
         return;
       }
@@ -216,37 +257,64 @@ class _CaptureTabScreenState extends State<CaptureTabScreen>
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
       }
+      if (!isCurrent()) {
+        return;
+      }
 
       if (permission == LocationPermission.denied) {
-        if (!mounted) {
-          return;
-        }
         setState(() => _locationLabel = 'Permission denied');
         return;
       }
 
       if (permission == LocationPermission.deniedForever) {
-        if (!mounted) {
-          return;
-        }
         setState(() => _locationLabel = 'Permission blocked');
         return;
       }
 
+      // A raw GPS cold fix (no network/Play Services assistance, e.g. on
+      // GrapheneOS without Sandboxed Google Play) is confirmed by GrapheneOS's
+      // own team to normally take 2-5+ minutes outdoors on first use. No
+      // timeLimit would hang forever with nothing to show; too short a one
+      // would misreport that normal wait as a failure.
       final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
+        locationSettings: resolveLocationSettings(
           accuracy: LocationAccuracy.high,
+          timeLimit: const Duration(minutes: 2),
         ),
       );
-      if (!mounted) {
+      if (!isCurrent()) {
         return;
       }
       setState(() => _locationLabel = _formatPosition(position));
-    } catch (_) {
+    } catch (error) {
+      if (!isCurrent()) {
+        return;
+      }
+      // A GPS-only cold fix (no network/Play Services assistance) can
+      // legitimately take several minutes - a timeout here just means
+      // "still trying," not "broken."
+      setState(
+        () => _locationLabel = error is TimeoutException
+            ? 'Still acquiring GPS'
+            : 'GPS unavailable',
+      );
+      // This HUD readout is too tight to show a full exception without
+      // breaking the layout, so surface it via a snackbar the user can read
+      // and dismiss instead - see capture_screen.dart's blocked-capture
+      // panel for the equivalent on the actual capture flow.
       if (!mounted) {
         return;
       }
-      setState(() => _locationLabel = 'GPS unavailable');
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text('GPS error: ${error.runtimeType}: $error'),
+            duration: const Duration(seconds: 12),
+          ),
+        );
+    } finally {
+      _isFetchingLocation = false;
     }
   }
 

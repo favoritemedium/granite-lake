@@ -151,10 +151,13 @@ class PhotoAttestationException implements Exception {
     }
 
     if (operation == 'claim') {
-      return 'Could not reach the OTP backend. Check that the API is running and that this app build has a backend configured for your company domain.';
+      return "Couldn't reach the verification server. Check your internet "
+          'connection and try again. If this keeps happening, contact your '
+          'administrator.';
     }
 
-    return 'Network access failed. Check your connection and try again.';
+    return "Couldn't connect to the network. Check your internet connection "
+        'and try again.';
   }
 
   static String _translateMessage(

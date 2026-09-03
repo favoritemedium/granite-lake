@@ -15,6 +15,7 @@ import '../../../core/router/app_router.dart';
 import '../../../core/state/granite_lake_controller.dart';
 import '../../../core/theme/app_colors.dart';
 import '../../../core/theme/app_text_styles.dart';
+import '../../../core/utils/location_settings.dart';
 
 enum _CaptureFlow { live, review, submitting, success }
 
@@ -74,6 +75,21 @@ class _CaptureScreenState extends State<CaptureScreen> {
   String _networkStatusLabel = 'Checking...';
   bool _isMockLocationDetected = false;
   Timer? _networkTimer;
+  // Raw exception from the last failed GPS fix, shown verbatim in the
+  // capture-blocked panel so it can be diagnosed on-device without adb.
+  // Kept separate from _gpsStatusLabel: that field is embedded directly in
+  // the forensic capture metadata and gates _hasGpsFix via a ", " check, so
+  // it must stay a clean status string, never raw error text.
+  String? _gpsDebugError;
+  // On GrapheneOS without Sandboxed Google Play there is no network location
+  // provider at all (by design - see grapheneos.org/usage and
+  // https://discuss.grapheneos.org/d/79-location-not-working), so every fix
+  // is a raw GPS cold start: 2-5+ minutes outdoors is normal, confirmed by
+  // GrapheneOS's own team. Restarting that request from scratch every 30s
+  // (the readiness timer's interval) would thrash it and could make the fix
+  // take even longer, so skip relaunching _refreshLocation while one is
+  // already in flight - let it run to its own (patient) timeLimit instead.
+  bool _isFetchingLocation = false;
 
   _CaptureFlow _flow = _CaptureFlow.live;
   int _submissionRunId = 0;
@@ -159,6 +175,11 @@ class _CaptureScreenState extends State<CaptureScreen> {
   }
 
   Future<_LocationSnapshot?> _refreshLocation() async {
+    if (_isFetchingLocation) {
+      debugPrint('[READINESS] _refreshLocation skipped - already in flight');
+      return null;
+    }
+    _isFetchingLocation = true;
     final sw = Stopwatch()..start();
     debugPrint(
       '[READINESS] _refreshLocation start @${DateTime.now().toIso8601String()}',
@@ -169,6 +190,7 @@ class _CaptureScreenState extends State<CaptureScreen> {
           _gpsStatusLabel = 'Locating...';
           _altitudeStatusLabel = 'Fetching altitude...';
           _isMockLocationDetected = false;
+          _gpsDebugError = null;
         });
       }
 
@@ -226,9 +248,16 @@ class _CaptureScreenState extends State<CaptureScreen> {
       debugPrint(
         '[READINESS] calling getCurrentPosition elapsed=${sw.elapsedMilliseconds}ms',
       );
+      // A raw GPS cold fix (no network/Play Services assistance, e.g. on
+      // GrapheneOS without Sandboxed Google Play) is confirmed by GrapheneOS's
+      // own team to normally take 2-5+ minutes outdoors on first use. No
+      // timeLimit would hang forever with nothing to show; too short a one
+      // (e.g. 30s) would misreport that normal wait as a failure. 2 minutes
+      // balances the two - still bounded, but won't fire on a healthy fix.
       final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
+        locationSettings: resolveLocationSettings(
           accuracy: LocationAccuracy.high,
+          timeLimit: const Duration(minutes: 2),
         ),
       );
       debugPrint(
@@ -262,11 +291,23 @@ class _CaptureScreenState extends State<CaptureScreen> {
         return null;
       }
       setState(() {
-        _gpsStatusLabel = 'GPS unavailable';
+        // A GPS-only cold fix (no network/Play Services assistance) can
+        // legitimately take several minutes - a timeout here just means
+        // "still trying," not "broken." Say so instead of implying failure.
+        // The 30s/15s readiness timers keep retrying automatically either way.
+        // No ", " anywhere in this string - _hasGpsFix below treats that
+        // substring as "looks like a real lat/lng fix" and would wrongly
+        // unblock capture without one.
+        _gpsStatusLabel = error is TimeoutException
+            ? 'Still acquiring GPS - first fix outdoors can take a few minutes'
+            : 'GPS unavailable';
         _altitudeStatusLabel = 'Altitude unavailable';
         _isMockLocationDetected = false;
+        _gpsDebugError = '${error.runtimeType}: $error';
       });
       return null;
+    } finally {
+      _isFetchingLocation = false;
     }
   }
 
@@ -1846,8 +1887,20 @@ class _CaptureScreenState extends State<CaptureScreen> {
     if (_isMockLocationDetected) {
       return 'Mock location detected. Disable mock location before using camera capture.';
     }
+    if (_gpsStatusLabel == 'Location off') {
+      // This is the device-wide Location services toggle (Settings >
+      // Location), not this app's own Location permission - the app
+      // permission page can say "Allowed" while this is still off, and
+      // no app can get a fix until it's on.
+      return 'Turn on Location in your device Settings (Settings > Location) - '
+          "this is separate from this app's own Location permission, which "
+          'can already be granted while the device-wide toggle is off.';
+    }
     if (!_hasGpsFix) {
-      return 'Position data is required before capture. Status: $_gpsStatusLabel';
+      final debugError = _gpsDebugError;
+      return debugError == null
+          ? 'Position data is required before capture. Status: $_gpsStatusLabel'
+          : 'Position data is required before capture. Status: $_gpsStatusLabel\n\n$debugError';
     }
     return 'Internet connectivity is required before capture. Status: $_networkStatusLabel';
   }
