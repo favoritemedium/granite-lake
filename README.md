@@ -204,8 +204,27 @@ At a high level:
 
    `attester` must match the domain's admin wallet registered in step 2, and `chain_id` must match the network the registry entry lives on (e.g. `sui:testnet`, `sui:mainnet`). Set `revoked=true` to invalidate the record without removing it. Both `verification_api` (server-side) and `verification_portal` (client-side, in-browser) look this record up against Cloudflare, Google, and AliDNS for consensus, and additionally report DNSSEC validation when both Cloudflare and Google confirm the `AD` flag on the lookup.
 
-5. Run OTP registration from the app.
-6. Capture and attest photos from an enabled wallet.
+5. Enable DNSSEC on the domain so the `AD` flag can be confirmed:
+
+   1. Sign the zone in your DNS provider's dashboard or CLI (e.g. Cloudflare, Route 53, Google Cloud DNS) — most providers offer a one-click "Enable DNSSEC" toggle that generates the signing keys and DS record for you.
+   2. Copy the resulting DS record (key tag, algorithm, digest type, digest) from your DNS provider.
+   3. Add that DS record at your domain registrar (not the DNS provider, if they differ) to chain the trust up to the parent zone.
+   4. Wait for DNS propagation (can take up to 24-48 hours depending on TTLs), then confirm signing is live:
+
+      ```bash
+      dig +dnssec _attest.<domain> TXT
+      ```
+
+      Look for the `RRSIG` record in the answer and the `ad` flag in the response header. You can also validate the full chain with:
+
+      ```bash
+      delv _attest.<domain> TXT
+      ```
+
+   Without DNSSEC enabled, the `_attest.<domain>` TXT lookup still works, but `dnssecValidated` reports `null`/`false` instead of `true`. See `verification_api/README.md` for how `dnssecValidated` is computed.
+
+6. Run OTP registration from the app.
+7. Capture and attest photos from an enabled wallet.
 
 See:
 
