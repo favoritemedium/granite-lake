@@ -196,14 +196,25 @@ At a high level:
 1. Publish or use the configured Granite Lake Move package.
 2. Register a domain with its admin wallet in the shared registry.
 3. Configure the server with matching `DOMAIN`, `ADMIN_WALLET`, `SUI_PRIVATE_KEY`, `SUI_PACKAGE_ID`, and `SUI_REGISTRY_ID`. `SUI_PRIVATE_KEY` can be a literal env value when Vault is disabled, or a `vault://` reference when Vault is enabled.
-4. Run OTP registration from the app.
-5. Capture and attest photos from an enabled wallet.
+4. Publish a DNS TXT record at `_attest.<domain>` so `verification_api` and `verification_portal` can each confirm the domain's attester wallet out-of-band from the chain. The record value must be `;`-separated `key=value` pairs including `chain_id`, `attester`, and `revoked`, for example:
+
+   ```text
+   chain_id=sui:testnet;attester=0x<admin-wallet-address>;revoked=false
+   ```
+
+   `attester` must match the domain's admin wallet registered in step 2, and `chain_id` must match the network the registry entry lives on (e.g. `sui:testnet`, `sui:mainnet`). Set `revoked=true` to invalidate the record without removing it. Both `verification_api` (server-side) and `verification_portal` (client-side, in-browser) look this record up against Cloudflare, Google, and AliDNS for consensus, and additionally report DNSSEC validation when both Cloudflare and Google confirm the `AD` flag on the lookup.
+
+5. Run OTP registration from the app.
+6. Capture and attest photos from an enabled wallet.
 
 See:
 
 - `contracts/README.md` for Move package behavior
 - `server/README.md` for API configuration and OTP routes
 - `app/README.md` for app storage, onboarding, and photo/file attestation flow
+- `verification_api/README.md` for the server-side DNS TXT consensus lookup and DNSSEC validation details
+- `verification_portal/README.md` for the client-side (in-browser) DNS TXT consensus lookup
+- `verification_api/README.md` for DNS TXT consensus lookup and DNSSEC validation details
 
 ## License
 
