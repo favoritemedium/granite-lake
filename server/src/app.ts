@@ -5,6 +5,26 @@ import { adminRoutes } from "./routes/admin.js";
 import { healthRoutes } from "./routes/health.js";
 import { otpRoutes } from "./routes/otp.js";
 
+// Libraries like undici and protobuf-ts wrap the real errno-level failure
+// (ECONNRESET, ETIMEDOUT, ...) several `.cause` levels deep behind a generic
+// message ("fetch failed"). Pino's default err serializer doesn't unwrap it,
+// so surface the chain explicitly to make network failures diagnosable.
+function serializeCauseChain(error: unknown, maxDepth = 5): Array<Record<string, unknown>> {
+  const chain: Array<Record<string, unknown>> = [];
+  let current = error instanceof Error ? (error as { cause?: unknown }).cause : undefined;
+
+  while (current instanceof Error && chain.length < maxDepth) {
+    chain.push({
+      name: current.name,
+      message: current.message,
+      code: (current as NodeJS.ErrnoException).code,
+    });
+    current = (current as { cause?: unknown }).cause;
+  }
+
+  return chain;
+}
+
 export async function buildApp() {
   const app = Fastify({
     logger: true,
@@ -18,7 +38,7 @@ export async function buildApp() {
   // error codes — straight to an unauthenticated caller.
   app.setErrorHandler((error: FastifyError, request, reply) => {
     const correlationId = randomUUID();
-    request.log.error({ err: error, correlationId }, "Unhandled request error");
+    request.log.error({ err: error, causeChain: serializeCauseChain(error), correlationId }, "Unhandled request error");
 
     const statusCode =
       typeof error.statusCode === "number" && error.statusCode >= 400 && error.statusCode < 600

@@ -10,6 +10,48 @@ export type AddUserResult = {
   userCapId: string;
 };
 
+const TRANSIENT_NETWORK_ERROR_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EPIPE",
+  "ECONNABORTED",
+]);
+
+// Undici and the gRPC-web transport both collapse real network failures into
+// a generic "fetch failed" / RpcError a few `.cause` levels deep.
+function isTransientNetworkError(error: unknown, depth = 0): boolean {
+  if (!(error instanceof Error) || depth > 5) return false;
+
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code && TRANSIENT_NETWORK_ERROR_CODES.has(code)) return true;
+  if (error.name === "RpcError" || /fetch failed/i.test(error.message)) return true;
+
+  return isTransientNetworkError((error as { cause?: unknown }).cause, depth + 1);
+}
+
+// Retries only transient network failures. Safe to rebuild-and-resubmit here
+// because the failures we've seen occur while the SDK resolves gas/coin data
+// during Transaction.build(), before anything is signed or broadcast. Each
+// attempt must build a fresh Transaction (see callers) rather than reusing
+// one across retries, since we can't assume partial build state is clean.
+async function withNetworkRetry<T>(fn: () => Promise<T>, attempts = 3, baseDelayMs = 300): Promise<T> {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (attempt === attempts || !isTransientNetworkError(error)) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1)));
+    }
+  }
+
+  throw new Error("unreachable");
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ExecuteTransactionResult = any;
 
@@ -122,23 +164,24 @@ export class SuiService {
   }): Promise<{ digest: string; result: ExecuteTransactionResult }> {
     const keypair = await this.initializeKeypair();
 
-    const tx = new Transaction();
+    const result = await withNetworkRetry(() => {
+      const tx = new Transaction();
 
-    tx.moveCall({
-      target: `${this.appEnv.SUI_PACKAGE_ID}::${this.appEnv.SUI_MODULE}::${params.functionName}`,
-      arguments: [
-        tx.object(this.appEnv.SUI_REGISTRY_ID),
-        tx.pure.vector("u8", Array.from(Buffer.from(params.domain, "utf8"))),
-        tx.pure.address(params.userWallet),
-      ],
-    });
+      tx.moveCall({
+        target: `${this.appEnv.SUI_PACKAGE_ID}::${this.appEnv.SUI_MODULE}::${params.functionName}`,
+        arguments: [
+          tx.object(this.appEnv.SUI_REGISTRY_ID),
+          tx.pure.vector("u8", Array.from(Buffer.from(params.domain, "utf8"))),
+          tx.pure.address(params.userWallet),
+        ],
+      });
 
-    tx.setGasBudget(this.appEnv.SUI_GAS_BUDGET);
+      tx.setGasBudget(this.appEnv.SUI_GAS_BUDGET);
 
-    // Use keypair's signAndExecuteTransaction
-    const result = await keypair.signAndExecuteTransaction({
-      transaction: tx,
-      client: this.client,
+      return keypair.signAndExecuteTransaction({
+        transaction: tx,
+        client: this.client,
+      });
     });
 
     // Check for failed transaction
