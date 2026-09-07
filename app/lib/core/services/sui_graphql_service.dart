@@ -1,8 +1,42 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
 
 import 'package:http/http.dart' as http;
 import 'package:on_chain/on_chain.dart';
+
+/// True for network-level failures (dropped connection, DNS blip, timeout)
+/// worth a quiet retry. False for anything the server actually responded to
+/// — a bad status code or a GraphQL `errors` payload means the request was
+/// received and rejected, so retrying it would just repeat the failure.
+bool _isTransientNetworkError(Object error) {
+  return error is SocketException ||
+      error is TimeoutException ||
+      error is http.ClientException;
+}
+
+/// Retries [request] on transient network errors only. Bounded and short by
+/// design: this runs underneath higher-level retry/backoff already in the
+/// app (see GraniteLakeController's verification retry), so it exists to
+/// smooth over brief blips, not to carry the app through a real outage.
+Future<T> _withNetworkRetry<T>(
+  Future<T> Function() request, {
+  int attempts = 3,
+  Duration baseDelay = const Duration(milliseconds: 300),
+}) async {
+  for (var attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await request();
+    } catch (error) {
+      if (attempt == attempts || !_isTransientNetworkError(error)) {
+        rethrow;
+      }
+      await Future<void>.delayed(baseDelay * pow(2, attempt - 1));
+    }
+  }
+  throw StateError('unreachable');
+}
 
 class SuiGraphQlObject {
   const SuiGraphQlObject({
@@ -556,16 +590,18 @@ class SuiGraphQlService {
     Map<String, dynamic>? variables,
   }) async {
     final normalizedUrl = normalizeUrl(url);
-    final response = await _client
-        .post(
-          Uri.parse(normalizedUrl),
-          headers: const {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'query': query,
-            ...?variables == null ? null : {'variables': variables},
-          }),
-        )
-        .timeout(defaultTimeout);
+    final response = await _withNetworkRetry(
+      () => _client
+          .post(
+            Uri.parse(normalizedUrl),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'query': query,
+              ...?variables == null ? null : {'variables': variables},
+            }),
+          )
+          .timeout(defaultTimeout),
+    );
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       final legacyHint = normalizedUrl != url.trim()
