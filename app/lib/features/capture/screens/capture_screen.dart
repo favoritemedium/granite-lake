@@ -186,10 +186,32 @@ class _CaptureScreenState extends State<CaptureScreen> {
     );
     try {
       if (mounted) {
+        // Seed instantly from whatever fix the app most recently resolved
+        // (e.g. CaptureTabScreen's background check, already running before
+        // the user tapped in) instead of always starting blank at
+        // "Locating...". The fresh fetch below still runs and overwrites
+        // this the moment it completes - this only speeds up the first
+        // paint, it never substitutes a stale value for a real one.
+        final cachedController = GraniteLakeScope.of(context);
+        final cachedPosition = cachedController.lastKnownPosition;
+        final cachedAt = cachedController.lastKnownPositionAt;
+        final isCacheFresh =
+            cachedPosition != null &&
+            cachedAt != null &&
+            DateTime.now().difference(cachedAt) < const Duration(seconds: 20);
+        debugPrint(
+          '[READINESS] cache check isFresh=$isCacheFresh cachedAt=$cachedAt elapsed=${sw.elapsedMilliseconds}ms',
+        );
         setState(() {
-          _gpsStatusLabel = 'Locating...';
-          _altitudeStatusLabel = 'Fetching altitude...';
-          _isMockLocationDetected = false;
+          _gpsStatusLabel = isCacheFresh
+              ? _formatPosition(cachedPosition)
+              : 'Locating...';
+          _altitudeStatusLabel = isCacheFresh
+              ? _formatAltitude(cachedPosition)
+              : 'Fetching altitude...';
+          _isMockLocationDetected = isCacheFresh
+              ? _detectMockLocation(cachedPosition)
+              : false;
           _gpsDebugError = null;
         });
       }
@@ -248,18 +270,11 @@ class _CaptureScreenState extends State<CaptureScreen> {
       debugPrint(
         '[READINESS] calling getCurrentPosition elapsed=${sw.elapsedMilliseconds}ms',
       );
-      // A raw GPS cold fix (no network/Play Services assistance, e.g. on
-      // GrapheneOS without Sandboxed Google Play) is confirmed by GrapheneOS's
-      // own team to normally take 2-5+ minutes outdoors on first use. No
-      // timeLimit would hang forever with nothing to show; too short a one
-      // (e.g. 30s) would misreport that normal wait as a failure. 2 minutes
-      // balances the two - still bounded, but won't fire on a healthy fix.
-      final position = await Geolocator.getCurrentPosition(
-        locationSettings: resolveLocationSettings(
-          accuracy: LocationAccuracy.high,
-          timeLimit: const Duration(minutes: 2),
-        ),
-      );
+      // See resolveBestEffortPosition: tries Google's network/Wi-Fi location
+      // first (seconds, works indoors) and only falls back to a patient
+      // raw-GPS fix (minutes) when that can't resolve at all, e.g.
+      // GrapheneOS without Sandboxed Google Play.
+      final position = await resolveBestEffortPosition();
       debugPrint(
         '[READINESS] getCurrentPosition -> lat=${position.latitude} lng=${position.longitude} elapsed=${sw.elapsedMilliseconds}ms',
       );
@@ -274,6 +289,7 @@ class _CaptureScreenState extends State<CaptureScreen> {
       if (!mounted) {
         return snapshot;
       }
+      GraniteLakeScope.of(context).recordLocationFix(position);
       setState(() {
         _gpsStatusLabel = snapshot.gpsLabel;
         _altitudeStatusLabel = snapshot.altitudeLabel;
@@ -960,7 +976,13 @@ class _CaptureScreenState extends State<CaptureScreen> {
                     bottom: 24,
                     child: _ErrorBanner(message: _errorMessage!),
                   ),
-                if (!_isPreparing && _errorMessage == null) ...[
+                // Shown even while the camera is still preparing (not just
+                // once !_isPreparing): GPS/network readiness runs concurrently
+                // with camera startup, on its own separate timeline. Hiding
+                // this whole strip behind the camera spinner made a slow
+                // camera init look like a slow GPS fix (or vice versa) - with
+                // both visible, whichever one is still pending is obvious.
+                if (_errorMessage == null) ...[
                   Positioned(
                     left: 28,
                     top: isCompact ? 120 : 160,
@@ -979,7 +1001,7 @@ class _CaptureScreenState extends State<CaptureScreen> {
                     top: isCompact ? 120 : 160,
                     child: _LabeledMetric(
                       label: 'REAR CAMERA',
-                      value: liveCameraLabel,
+                      value: _isPreparing ? 'Preparing...' : liveCameraLabel,
                       alignEnd: true,
                     ),
                   ),
@@ -1742,7 +1764,21 @@ class _CaptureScreenState extends State<CaptureScreen> {
 
   Widget _buildPreview() {
     if (_isPreparing) {
-      return const Center(child: CircularProgressIndicator());
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const CircularProgressIndicator(),
+            const SizedBox(height: 12),
+            Text(
+              'Preparing camera...',
+              style: AppTextStyles.bodyMedium.copyWith(
+                color: AppColors.textSecondary,
+              ),
+            ),
+          ],
+        ),
+      );
     }
 
     final controller = _cameraController;

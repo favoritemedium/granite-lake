@@ -271,20 +271,17 @@ class _CaptureTabScreenState extends State<CaptureTabScreen>
         return;
       }
 
-      // A raw GPS cold fix (no network/Play Services assistance, e.g. on
-      // GrapheneOS without Sandboxed Google Play) is confirmed by GrapheneOS's
-      // own team to normally take 2-5+ minutes outdoors on first use. No
-      // timeLimit would hang forever with nothing to show; too short a one
-      // would misreport that normal wait as a failure.
-      final position = await Geolocator.getCurrentPosition(
-        locationSettings: resolveLocationSettings(
-          accuracy: LocationAccuracy.high,
-          timeLimit: const Duration(minutes: 2),
-        ),
-      );
-      if (!isCurrent()) {
+      // See resolveBestEffortPosition: tries Google's network/Wi-Fi location
+      // first (seconds, works indoors) and only falls back to a patient
+      // raw-GPS fix (minutes) when that can't resolve at all, e.g.
+      // GrapheneOS without Sandboxed Google Play.
+      final position = await resolveBestEffortPosition();
+      if (!isCurrent() || !mounted) {
         return;
       }
+      // Lets CaptureScreen seed instantly from this fix instead of paying
+      // its own cold-start cost - see GraniteLakeController.recordLocationFix.
+      GraniteLakeScope.of(context).recordLocationFix(position);
       setState(() => _locationLabel = _formatPosition(position));
     } catch (error) {
       if (!isCurrent()) {

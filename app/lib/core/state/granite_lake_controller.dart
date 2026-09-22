@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:on_chain/sui/sui.dart';
 
 import '../database/granite_lake_data_controllers.dart';
@@ -69,6 +70,8 @@ class GraniteLakeController extends ChangeNotifier {
   BigInt? _walletSuiBalanceMist;
   bool _isRefreshingWalletSuiBalance = false;
   bool _isDarkMode = false;
+  Position? _lastKnownPosition;
+  DateTime? _lastKnownPositionAt;
 
   bool get isInitializing => _isInitializing;
   String? get initializationError => _initializationError;
@@ -97,6 +100,22 @@ class GraniteLakeController extends ChangeNotifier {
   String? get selectedProjectId => _selectedProjectId;
   PhotoAttestationContractConfig? get photoAttestationConfig =>
       _photoAttestationConfig;
+  Position? get lastKnownPosition => _lastKnownPosition;
+  DateTime? get lastKnownPositionAt => _lastKnownPositionAt;
+
+  // Lets CaptureScreen seed its GPS readout from whatever fix the app most
+  // recently resolved (e.g. CaptureTabScreen's own periodic check, already
+  // running before the user taps in) instead of paying a second cold
+  // network-location scan on every entry - that redundant cold fetch was
+  // the ~8-11s wait users hit even after the network-first fallback fix,
+  // since each screen tracked its own fix independently. Intentionally does
+  // not notifyListeners(): this is a plain cache for the next screen's
+  // initial read, not a value any widget should rebuild on.
+  void recordLocationFix(Position position) {
+    _lastKnownPosition = position;
+    _lastKnownPositionAt = DateTime.now();
+  }
+
   bool get requiresLocalDataInitialization => _requiresLocalDataInitialization;
   BigInt? get walletSuiBalanceMist => _walletSuiBalanceMist;
   bool get isRefreshingWalletSuiBalance => _isRefreshingWalletSuiBalance;
