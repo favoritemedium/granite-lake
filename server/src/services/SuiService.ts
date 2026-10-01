@@ -157,6 +157,30 @@ export class SuiService {
     return digest;
   }
 
+  /**
+   * Gas is resolved by the SDK, which pays from the address balance when it
+   * covers the budget and from coin objects otherwise. When a call fails, log
+   * how the admin wallet's SUI is held so a gas failure is diagnosable.
+   */
+  private async logGasState(owner: string, error: unknown): Promise<void> {
+    try {
+      const { balance } = await this.client.core.getBalance({ owner });
+      console.error("Sui admin call failed", {
+        error: error instanceof Error ? error.message : String(error),
+        owner,
+        gasBudget: this.appEnv.SUI_GAS_BUDGET,
+        totalBalance: balance.balance,
+        coinBalance: balance.coinBalance,
+        addressBalance: balance.addressBalance,
+      });
+    } catch (balanceError) {
+      console.error("Sui admin call failed; balance lookup also failed", {
+        error: error instanceof Error ? error.message : String(error),
+        balanceError: balanceError instanceof Error ? balanceError.message : String(balanceError),
+      });
+    }
+  }
+
   private async executeDomainAdminCall(params: {
     functionName: "add_user" | "disable_user" | "enable_user";
     domain: string;
@@ -164,25 +188,31 @@ export class SuiService {
   }): Promise<{ digest: string; result: ExecuteTransactionResult }> {
     const keypair = await this.initializeKeypair();
 
-    const result = await withNetworkRetry(() => {
-      const tx = new Transaction();
+    let result: ExecuteTransactionResult;
+    try {
+      result = await withNetworkRetry(() => {
+        const tx = new Transaction();
 
-      tx.moveCall({
-        target: `${this.appEnv.SUI_PACKAGE_ID}::${this.appEnv.SUI_MODULE}::${params.functionName}`,
-        arguments: [
-          tx.object(this.appEnv.SUI_REGISTRY_ID),
-          tx.pure.vector("u8", Array.from(Buffer.from(params.domain, "utf8"))),
-          tx.pure.address(params.userWallet),
-        ],
+        tx.moveCall({
+          target: `${this.appEnv.SUI_PACKAGE_ID}::${this.appEnv.SUI_MODULE}::${params.functionName}`,
+          arguments: [
+            tx.object(this.appEnv.SUI_REGISTRY_ID),
+            tx.pure.vector("u8", Array.from(Buffer.from(params.domain, "utf8"))),
+            tx.pure.address(params.userWallet),
+          ],
+        });
+
+        tx.setGasBudget(this.appEnv.SUI_GAS_BUDGET);
+
+        return keypair.signAndExecuteTransaction({
+          transaction: tx,
+          client: this.client,
+        });
       });
-
-      tx.setGasBudget(this.appEnv.SUI_GAS_BUDGET);
-
-      return keypair.signAndExecuteTransaction({
-        transaction: tx,
-        client: this.client,
-      });
-    });
+    } catch (error) {
+      await this.logGasState(keypair.toSuiAddress(), error);
+      throw error;
+    }
 
     // Check for failed transaction
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

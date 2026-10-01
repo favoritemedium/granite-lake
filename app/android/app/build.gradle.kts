@@ -10,6 +10,7 @@ plugins {
 
 dependencies {
     implementation("androidx.biometric:biometric:1.1.0")
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
 }
 
 val keystorePropertiesFile = rootProject.file("key.properties")

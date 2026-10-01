@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:cryptography/cryptography.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:on_chain/sui/sui.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
@@ -16,6 +18,13 @@ class GraniteLakeCaptureWorkflowService {
     : _sha256 = sha256 ?? Sha256();
 
   final Sha256 _sha256;
+
+  // Same native channel granite_lake_secure_state_service.dart already uses
+  // for biometric-gate calls; `stripGpsExif` lives on the Android side of
+  // it too since it needs androidx.exifinterface, a native dependency.
+  static const MethodChannel _nativeChannel = MethodChannel(
+    'granite_lake/biometric_gate',
+  );
 
   Future<AttestationActionResult> persistCapture({
     required PhotoCaptureDataController photoCaptureDataController,
@@ -238,6 +247,18 @@ class GraniteLakeCaptureWorkflowService {
       sourcePath,
     ).copy(destinationImagePath);
 
+    if (assetType == AttestationAssetType.photo) {
+      // Must happen before hashing: GPS proof comes from Geolocator (passed
+      // in separately as gpsLabel/proofPayload below), never from this
+      // EXIF tag, so stripping it here costs nothing. Leaving it in would
+      // mean Android's MediaProvider location redaction (silently zeroing
+      // those EXIF bytes for any reader without ACCESS_MEDIA_LOCATION -
+      // hash apps, share sheets, uploads) could change this file's hash
+      // after it's already attested, on a copy nothing actually tampered
+      // with.
+      await _stripGpsExif(destinationImagePath);
+    }
+
     final imageBytes = await destinationImageFile.readAsBytes();
     final imageHash = await _sha256.hash(imageBytes);
     final imageSha256 = _hex(imageHash.bytes);
@@ -321,6 +342,21 @@ class GraniteLakeCaptureWorkflowService {
       await sourceFile.delete();
     }
     return record;
+  }
+
+  Future<void> _stripGpsExif(String imagePath) async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+    try {
+      await _nativeChannel.invokeMethod<void>('stripGpsExif', {
+        'path': imagePath,
+      });
+    } on PlatformException catch (error) {
+      // Best-effort: a capture with GPS EXIF still intact is strictly
+      // better than losing the capture outright over a stripping failure.
+      debugPrint('stripGpsExif failed: ${error.message}');
+    }
   }
 
   Future<void> clearCaptureArtifacts() async {

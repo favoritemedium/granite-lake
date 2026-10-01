@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:geolocator/geolocator.dart';
 
 /// Builds [LocationSettings] for [Geolocator.getCurrentPosition]/streams.
@@ -22,4 +24,42 @@ LocationSettings resolveLocationSettings({
   Duration? timeLimit,
 }) {
   return LocationSettings(accuracy: accuracy, timeLimit: timeLimit);
+}
+
+/// Tries Google Play Services' network/Wi-Fi-based positioning first, and
+/// only falls back to a raw GPS fix if that can't resolve at all.
+///
+/// `LocationAccuracy.high` (Android's `PRIORITY_HIGH_ACCURACY`) biases the
+/// fused provider toward the GPS chip's own satellite lock, which is
+/// normally unreachable indoors - that's what was leaving the HUD stuck on
+/// "Still acquiring GPS" for the full [gpsTimeout] in every indoor use.
+/// `LocationAccuracy.medium` (`PRIORITY_BALANCED_POWER_ACCURACY`) instead
+/// asks the same Play Services client to resolve from cell/Wi-Fi scan data
+/// (Google's network location API), which answers in a few seconds
+/// indoors and out, on every device with Play Services.
+///
+/// The GPS fallback only matters for the devices with no Play Services at
+/// all (e.g. GrapheneOS without Sandboxed Google Play), where the network
+/// attempt has nothing to answer with and just times out - those still get
+/// the original patient, GPS-only fix (see [resolveLocationSettings]'s
+/// GrapheneOS cold-start note) instead of being left without one.
+Future<Position> resolveBestEffortPosition({
+  Duration networkTimeout = const Duration(seconds: 10),
+  Duration gpsTimeout = const Duration(minutes: 2),
+}) async {
+  try {
+    return await Geolocator.getCurrentPosition(
+      locationSettings: resolveLocationSettings(
+        accuracy: LocationAccuracy.medium,
+        timeLimit: networkTimeout,
+      ),
+    );
+  } on TimeoutException {
+    return await Geolocator.getCurrentPosition(
+      locationSettings: resolveLocationSettings(
+        accuracy: LocationAccuracy.high,
+        timeLimit: gpsTimeout,
+      ),
+    );
+  }
 }
