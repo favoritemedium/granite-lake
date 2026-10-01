@@ -9,6 +9,7 @@ import android.view.WindowManager
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
+import androidx.exifinterface.media.ExifInterface
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
@@ -51,6 +52,7 @@ class MainActivity : FlutterFragmentActivity() {
 					"createBiometricGate" -> createBiometricGate(call, result)
 					"unlockBiometricGate" -> unlockBiometricGate(call, result)
 					"deleteBiometricGate" -> deleteBiometricGate(call, result)
+					"stripGpsExif" -> stripGpsExif(call, result)
 					else -> result.notImplemented()
 				}
 			}
@@ -156,6 +158,71 @@ class MainActivity : FlutterFragmentActivity() {
 		deleteKeyIfPresent(alias)
 		result.success(null)
 	}
+
+	// GPS lat/long for attestation come from Geolocator, not from image EXIF
+	// (see capture_screen.dart) - the EXIF GPS tag on a camera JPEG is only
+	// ever an incidental side effect of the OS/camera writing it when device
+	// location is on. Android's MediaProvider redacts that EXIF GPS block
+	// (zeroes the tag values in place, same file size) for any reader that
+	// lacks ACCESS_MEDIA_LOCATION - including generic hash/share/upload
+	// tools, not just off-device transfers - which silently changes the
+	// file's hash after it was already attested. Stripping GPS at capture
+	// time, before hashing, means there's nothing left for that redaction
+	// to touch: the attested file and every later copy of it stay identical
+	// forever, on any reader.
+	private fun stripGpsExif(call: MethodCall, result: MethodChannel.Result) {
+		val path = call.argument<String>("path")
+		if (path.isNullOrEmpty()) {
+			result.error("invalid_arguments", "Missing image path.", null)
+			return
+		}
+
+		try {
+			val exif = ExifInterface(path)
+			for (tag in gpsExifTags) {
+				exif.setAttribute(tag, null)
+			}
+			exif.saveAttributes()
+			result.success(null)
+		} catch (error: Exception) {
+			result.error("strip_gps_exif_failed", error.message ?: "Could not strip GPS EXIF data.", null)
+		}
+	}
+
+	private val gpsExifTags = listOf(
+		ExifInterface.TAG_GPS_VERSION_ID,
+		ExifInterface.TAG_GPS_LATITUDE_REF,
+		ExifInterface.TAG_GPS_LATITUDE,
+		ExifInterface.TAG_GPS_LONGITUDE_REF,
+		ExifInterface.TAG_GPS_LONGITUDE,
+		ExifInterface.TAG_GPS_ALTITUDE_REF,
+		ExifInterface.TAG_GPS_ALTITUDE,
+		ExifInterface.TAG_GPS_TIMESTAMP,
+		ExifInterface.TAG_GPS_DATESTAMP,
+		ExifInterface.TAG_GPS_SATELLITES,
+		ExifInterface.TAG_GPS_STATUS,
+		ExifInterface.TAG_GPS_MEASURE_MODE,
+		ExifInterface.TAG_GPS_DOP,
+		ExifInterface.TAG_GPS_SPEED_REF,
+		ExifInterface.TAG_GPS_SPEED,
+		ExifInterface.TAG_GPS_TRACK_REF,
+		ExifInterface.TAG_GPS_TRACK,
+		ExifInterface.TAG_GPS_IMG_DIRECTION_REF,
+		ExifInterface.TAG_GPS_IMG_DIRECTION,
+		ExifInterface.TAG_GPS_MAP_DATUM,
+		ExifInterface.TAG_GPS_DEST_LATITUDE_REF,
+		ExifInterface.TAG_GPS_DEST_LATITUDE,
+		ExifInterface.TAG_GPS_DEST_LONGITUDE_REF,
+		ExifInterface.TAG_GPS_DEST_LONGITUDE,
+		ExifInterface.TAG_GPS_DEST_BEARING_REF,
+		ExifInterface.TAG_GPS_DEST_BEARING,
+		ExifInterface.TAG_GPS_DEST_DISTANCE_REF,
+		ExifInterface.TAG_GPS_DEST_DISTANCE,
+		ExifInterface.TAG_GPS_PROCESSING_METHOD,
+		ExifInterface.TAG_GPS_AREA_INFORMATION,
+		ExifInterface.TAG_GPS_DIFFERENTIAL,
+		ExifInterface.TAG_GPS_H_POSITIONING_ERROR,
+	)
 
 	private fun authenticate(
 		title: String,
