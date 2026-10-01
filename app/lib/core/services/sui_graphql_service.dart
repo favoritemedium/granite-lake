@@ -178,6 +178,22 @@ class SuiGraphQlService {
     return trimmed;
   }
 
+  /// Current epoch plus the chain identifier (genesis checkpoint digest, base58),
+  /// both needed for a `ValidDuring` expiration (address-balance gas payment).
+  Future<({BigInt epoch, String chainDigest})> getChainInfo(String url) async {
+    final data = await _request(
+      url,
+      query:
+          'query { epoch { epochId } checkpoint(sequenceNumber: 0) { digest } }',
+    );
+    final epoch = _asMap(data['epoch']);
+    final checkpoint = _asMap(data['checkpoint']);
+    return (
+      epoch: BigInt.parse(_asString(epoch['epochId'])),
+      chainDigest: _asString(checkpoint['digest']),
+    );
+  }
+
   Future<BigInt> getReferenceGasPrice(String url) async {
     final data = await _request(
       url,
@@ -185,6 +201,35 @@ class SuiGraphQlService {
     );
     final epoch = _asMap(data['epoch']);
     return BigInt.parse(_asString(epoch['referenceGasPrice']));
+  }
+
+  /// SUI held in the address balance (not in coin objects). Returns null when
+  /// the node does not expose `addressBalance`, so callers can fall back to an
+  /// estimate (total minus coin objects).
+  Future<BigInt?> getSuiAddressBalance(
+    String url, {
+    required String ownerAddress,
+  }) async {
+    try {
+      final data = await _request(
+        url,
+        query: r'''query($address:SuiAddress!){
+          address(address:$address){
+            balance(coinType:"0x2::sui::SUI"){
+              addressBalance
+            }
+          }
+        }''',
+        variables: {'address': ownerAddress},
+      );
+      final balance = _asMap(data['address'])['balance'];
+      if (balance == null) {
+        return BigInt.zero;
+      }
+      return BigInt.parse(_asString(_asMap(balance)['addressBalance']));
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<BigInt> getSuiBalance(
