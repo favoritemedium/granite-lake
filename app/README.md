@@ -21,21 +21,22 @@ The current onboarding and capture flow is:
 
 1. Prepare local app data
 2. Create a wallet on-device
-3. Link the device to a user account with:
+3. Protect the wallet with biometrics
+4. Link the device to a user account with:
    - company domain
    - employee / user id
    - OTP
-4. Protect the wallet with biometrics
-5. Start a secure session
+5. Start a secure session (30 minutes)
 6. Choose a capture method: capture a photo or upload a file
 7. Save the local signed proof bundle
 8. Submit `attest_photo` or `attest_file` to Sui testnet
 9. Verify later that on-chain event data matches the local photo or file attestation
 
-Important implementation detail:
+Important implementation details:
 
 - the user does not enter `packageId` or `registryId`
 - those are bundled in the app and synced into SQLite automatically at startup
+- biometric protection is set up before account registration, not after: the router redirects identity setup → biometric setup → registration, because the wallet's raw signing key exists unprotected in storage from the moment it is created until the hardware-backed biometric gate wraps it
 
 ## Current Sui Contract Defaults
 
@@ -45,11 +46,12 @@ Bundled defaults live in:
 
 Current testnet defaults:
 
-- RPC URL: `https://fullnode.testnet.sui.io:443`
+- GraphQL endpoint: `https://graphql.testnet.sui.io/graphql` (legacy `fullnode.*.sui.io` RPC URLs are normalized to their `graphql.*.sui.io/graphql` equivalents at runtime)
 - package id: `0xf4b83a02ad29b78266f8b1a39f5b533bde6bd5ef00eb434db46c3f7be29639db`
 - registry id: `0xde8b9f476c91dbdb05238c656a6ea3aa9f670e3b732e3e5d48628f5d2b66122d`
 - module: `photo_attestation`
 - faucet URL: `https://faucet.sui.io/?network=testnet`
+- minimum wallet SUI balance for attestation: 0.004 SUI (4,000,000 MIST)
 - OTP / UTC backend URL: resolved dynamically at runtime (see Backend URL Configuration below)
 
 Runtime behavior:
@@ -118,9 +120,9 @@ The app currently uses these contract entry points:
 OTP and UserCap claim flow:
 
 - the app calls the backend `POST /otp/request` endpoint with the company domain and user email
-- the backend delivers the OTP through its configured delivery channel
-- the app calls `POST /otp/verify` with `userId`, `otp`, `domain`, and the device wallet address
-- the backend verifies the OTP, then signs the contract `add_user` transaction with the configured domain-admin wallet
+- the backend delivers the OTP through its configured delivery channel and returns `userId`, `expiresAt`, and a server-issued `walletNonce`
+- the app calls `POST /otp/verify` with `userId`, `otp`, `domain`, the device wallet address (`userWallet`), and `userWalletSignature` — an Ed25519 personal-message signature over the `walletNonce`, proving the caller controls the wallet's private key
+- the backend verifies the OTP and the wallet signature, then signs the contract `add_user` transaction with the configured domain-admin wallet
 - after success, the backend returns the transaction digest and `UserCap` object id
 - the app stores the successful claim record in SQLite and verifies that the `UserCap` resolves for the device wallet
 
@@ -160,6 +162,20 @@ Because of that:
 - `sui_object_id` in the app is the `UserCap` object id used for attestation
 - the actual proof of attestation is the transaction plus the `PhotoAttested` or `FileAttested` event
 
+Sui GraphQL client:
+
+- all chain access goes through `lib/core/services/sui_graphql_service.dart`, which talks to the Sui GraphQL endpoint instead of the JSON-RPC fullnode
+- its public API is `getChainInfo`, `getReferenceGasPrice`, `getSuiAddressBalance`, `getSuiBalance`, `getObject`, `listOwnedObjectsByType`, `getTransaction`, `simulateTransaction`, and `executeTransaction`
+- `normalizeUrl` maps legacy `fullnode.*.sui.io` URLs to their `graphql.*.sui.io/graphql` equivalents so older stored configs keep working
+- requests are retried only on transient network errors (dropped connection, DNS blip, timeout): 3 attempts with exponential backoff; errors the server actually answered are never retried
+
+Gas payment and budgeting:
+
+- before execution, every attestation transaction is dry-run through `simulateTransaction`, and the gas budget is set from the dry-run's computation and storage costs plus a safety margin
+- gas is normally paid with owned `Coin<SUI>` objects selected to cover the budget (larger coins first, skipping coins already used as inputs by the transaction)
+- when coin objects alone do not cover the budget, the app falls back to paying gas from the wallet's address balance — where the Sui faucet deposits testnet funds: the transaction is submitted with an empty gas payment, and its BCS expiration is rewritten into a `ValidDuring` expiration carrying the current epoch and chain identifier (`_bcsWithValidDuringExpiration`, covered by `test/core/services/valid_during_bcs_test.dart`)
+- if neither source covers the budget, submission fails with a gas or insufficient-balance error
+
 ## Storage Layout
 
 Granite Lake separates storage into:
@@ -167,7 +183,7 @@ Granite Lake separates storage into:
 - Flutter secure storage for secret or session-gated state
 - SQLite for operational app data
 - Android Keystore for the biometric gate key
-- local filesystem for image binaries
+- local filesystem for captured photos and uploaded files
 
 ### Flutter secure storage
 
@@ -183,6 +199,7 @@ Secure records stored there:
 - `biometric_binding`
 - `biometric_gate_payload`
 - `session_record`
+- `device_registration`
 - `reset_notice`
 
 Concrete secure-storage keys used by the app:
@@ -193,7 +210,9 @@ Concrete secure-storage keys used by the app:
 - `biometric_binding`
 - `biometric_gate_payload`
 - `session_record`
+- `device_registration`
 - `reset_notice`
+- `otp_backend_build_version`
 
 Field layout for each stored value:
 
@@ -233,9 +252,19 @@ Field layout for each stored value:
     - `startedAt`: ISO-8601 UTC timestamp string
     - `expiresAt`: ISO-8601 UTC timestamp string
 
+- `device_registration`
+  - Type: JSON object
+  - Fields:
+    - `registeredAt`: ISO-8601 UTC timestamp string
+    - `model`, `manufacturer`, `platform`, `osVersion`: device descriptors captured when the device is registered
+
 - `reset_notice`
   - Type: string
   - Format: plain user-facing message shown after a destructive reset
+
+- `otp_backend_build_version`
+  - Type: string
+  - Format: backend resolver contract version (currently `2`, `AppConstants.otpBackendAppBuildVersion`), written by the backend URL resolver in `lib/core/utils/utils.dart`; a mismatch against the bundled version forces re-resolution of the backend configuration
 
 Important notes:
 
@@ -255,14 +284,17 @@ Schema and migrations:
 
 Current database version:
 
-- `6`
+- `9`
 
 Current tables:
 
 - `employees`
 - `projects`
-- `captures`
+- `photo_captures`
+- `uploaded_files`
 - `app_config`
+
+The legacy `captures` table only exists on installs upgraded from database version 7 or earlier; fresh installs never create it, and no controller reads or writes it.
 
 #### `employees`
 
@@ -277,6 +309,7 @@ Current fields include:
 - `company_domain`
 - `initials`
 - `is_placeholder`
+- `wallet_address`
 - `created_at`
 - `updated_at`
 
@@ -286,20 +319,22 @@ Behavior:
 - after successful account claim, the app replaces the placeholder row with the entered:
   - employee / user id
   - company domain
+  - wallet address of the device wallet
 
 #### `projects`
 
 Stores project definitions used during capture and history filtering.
 
-#### `captures`
+#### `photo_captures`
 
-Stores all persisted capture records, including:
+Stores camera photo records, including:
 
 - `captured_at`
 - `submitted_at`
 - local image path
 - image SHA-256
 - signature
+- `wallet_address` and `public_key_hex` of the signing wallet
 - proof payload JSON
 - `sui_tx_digest`
 - `sui_object_id` (`UserCap` object id)
@@ -308,18 +343,23 @@ Stores all persisted capture records, including:
 - project id
 - tags
 - note
+- `preview_kind`
+- `storage_mode`
 
 #### `uploaded_files`
 
 Stores uploaded file attestations separately from camera captures, including:
 
 - local file path and name
-- MIME type and size
+- MIME type, size, and file extension
 - file SHA-256
+- `wallet_address` and `public_key_hex` of the signing wallet
 - transaction digest
 - UserCap object id
 - submission status and error message
 - project id, tags, and note
+- `preview_kind`
+- `storage_mode`
 
 #### `app_config`
 
@@ -363,7 +403,8 @@ Important properties of the Keystore key:
 
 Implementation:
 
-- `android/app/src/main/kotlin/com/example/granite_lake/MainActivity.kt`
+- `android/app/src/main/kotlin/com/favoritemedium/granite_lake/MainActivity.kt`
+- the Android namespace and application id are `com.favoritemedium.granite_lake`
 
 Important Android key configuration includes:
 
@@ -382,6 +423,7 @@ Exposed method channel operations are:
 - `createBiometricGate`
 - `unlockBiometricGate`
 - `deleteBiometricGate`
+- `stripGpsExif` (GPS EXIF stripping, see Capture Pipeline below)
 
 ### What is actually encrypted by the biometric gate?
 
@@ -407,9 +449,10 @@ The sentinel exists as an integrity-bound extra value inside the protected bundl
 
 ### Local filesystem
 
-Only image binaries are stored in app documents storage:
+Captured photos and uploaded files are both stored in app documents storage:
 
-- `<app-documents>/captures/<captureId>/capture.jpg`
+- photos: `<app-documents>/captures/<captureId>/capture.jpg`
+- uploaded files: `<app-documents>/captures/<recordId>/<safeFileName>`, where `safeFileName` is the picked file name sanitized to `A-Za-z0-9._-` characters (falling back to `uploaded_asset` when nothing survives sanitization)
 
 If the app is reset after biometric invalidation or account deletion, Granite Lake removes the capture artifacts directory.
 
@@ -431,6 +474,7 @@ At a high level:
 - during session start, Granite Lake recovers the wrapped Sui key only after successful biometric approval
 - the unlocked signing key exists only in process memory during an active session
 - local proof payloads are signed only while a session is active
+- the Android activity sets `FLAG_SECURE` for the whole app, so screenshots, screen recording, and the recent-apps thumbnail are blocked on every screen
 
 ## Sui Private Key Lifecycle
 
@@ -475,7 +519,7 @@ When the user starts a secure session:
 2. Android prompts for biometric approval
 3. Android decrypts the protected bundle
 4. Flutter restores the Sui private key into `_sessionSigningKey`
-5. Flutter opens a short-lived `session_record`
+5. Flutter opens a short-lived `session_record` (sessions run for 30 minutes, `captureSessionDurationMinutes`)
 
 The decrypted key is kept only in memory.
 
@@ -498,9 +542,9 @@ Capture logic spans:
 Current sequence:
 
 1. copy the image into app documents storage
-2. compute SHA-256 of the image
-3. record `capturedAt` from the backend `GET /utc` endpoint at capture-button press time
-4. re-check current GPS and altitude at submit time and fail submission if the normalized formatted values no longer match the captured values
+2. strip GPS EXIF tags from the stored copy (Android only, before hashing)
+3. compute SHA-256 of the image
+4. record `capturedAt` from the backend `GET /utc` endpoint at capture-button press time
 5. record `submittedAt` from the backend `GET /utc` endpoint at submit-button press time
 6. build the signed proof payload
 7. sign the payload with the active session key
@@ -518,6 +562,24 @@ Current sequence:
 - submission status
 - translated error message if submission failed
 
+GPS EXIF stripping:
+
+- before hashing, the app invokes the `stripGpsExif` method-channel operation on the stored photo copy
+- this removes GPS-related EXIF tags in place so Android's later EXIF location redaction (applied for readers without `ACCESS_MEDIA_LOCATION`) cannot change the hash of an already-attested file
+- the attested GPS coordinates come from Geolocator, never from the photo's EXIF
+- stripping is best-effort: if it fails, the capture still proceeds
+
+Location resolution:
+
+- GPS fixes resolve network-first: `resolveBestEffortPosition` in `lib/core/utils/location_settings.dart` tries a medium-accuracy (cell/Wi-Fi) request with a 10-second timeout, then falls back to a high-accuracy GPS fix with a 2-minute timeout
+- the latest fix is cached in the controller (`recordLocationFix`) so the next screen seeds its readout without paying a second cold scan
+
+Wallet SUI balance gate:
+
+- the controller tracks the wallet's SUI balance (`walletSuiBalanceMist`, refreshed via `refreshWalletSuiBalance`)
+- photo and file submission abort with an "add test SUI" message when the balance is below 0.004 SUI / 4,000,000 MIST (`minimumAttestationSuiBalance` / `minimumAttestationMistBalance`)
+- the registration and profile screens surface the balance and this gate ("Add test funds first")
+
 Submission preconditions now include:
 
 - backend connectivity via `GET /utc`
@@ -526,6 +588,7 @@ Submission preconditions now include:
 - non-empty GPS label
 - non-empty altitude label
 - non-empty project id
+- wallet SUI balance at or above the minimum-balance gate
 
 The post-submit progress screen now reflects real pipeline stages:
 
@@ -533,6 +596,19 @@ The post-submit progress screen now reflects real pipeline stages:
 - saving local record
 - submitting to Sui testnet
 - refreshing device history
+
+The signed proof payload is built by `granite_lake_capture_workflow_service.dart` and includes:
+
+- `captureId` and `fileId`
+- `capturedAt` and `submittedAt`
+- `imagePath` and `imageSha256`
+- asset metadata: `assetType`, `fileName`, `mimeType`, `fileSizeBytes`, `fileExtension`, `previewKind`, `storageMode`
+- signing wallet: `walletAddress`, `publicKeyHex`
+- session bounds: `sessionStartedAt`, `sessionExpiresAt`
+- `signatureAlgorithm` (`SUI_ED25519`) and `signatureIntent` (`PERSONAL_MESSAGE`)
+- `appName` and `appVersion`
+- context labels when available: `buildLabel`, `gpsLabel`, `altitudeLabel`, `cameraLabel`, `cameraDetailsLabel`
+- `projectId`, `tags`, and `note`
 
 ## On-Chain Verification
 
@@ -549,6 +625,8 @@ The app fetches the transaction block and compares:
 - on-chain `altitude`
 - on-chain `project_id`
 - on-chain timestamp
+- on-chain sender: the transaction sender and the event sender must equal the device wallet address, and for `FileAttested` the event's `user_wallet` field must match as well
+- for files, the on-chain `file_id` must match the local file id
 
 against local capture data:
 
@@ -558,13 +636,22 @@ against local capture data:
 - `altitudeLabel`
 - `projectId`
 - `submittedAt`
+- `walletAddress`
+- `fileId`
 
 History behavior:
 
 - successful submission alone is not treated as fully verified
 - an anchored photo or file is marked verified only after the event fields match
-- chain timestamp is checked against local `submittedAt` with the configured tolerance window
+- chain timestamp is checked against local `submittedAt` with a 15-minute tolerance window (`maximumAttestationTimeGapMinutes`)
+- verification retries automatically on transient-looking failures (event not indexed yet, transaction not found, timeout, network): up to 5 attempts, delayed 3 seconds per attempt
+- a network failure keeps the record pending rather than marking it failed, since a failed round-trip is not evidence the on-chain attestation failed
 - mismatches and chain lookup failures are surfaced in history/detail state
+
+Operator-side verification tooling already exists at the repo root:
+
+- `verification_api/` exposes `POST /verify-attestation` for server-side checks
+- `verification_portal/` provides a browser-based, hash-first verification flow
 
 ## Error Handling
 
@@ -602,14 +689,15 @@ Granite Lake currently still supports a registration verifier model in secure st
 This remains part of the secure state service, but the active onboarding flow for Sui contract integration is centered on:
 
 - wallet setup
-- employee/domain claim via backend OTP verification
 - biometric protection
+- employee/domain claim via backend OTP verification
 
 The successful claim record stored in SQLite contains:
 
 - `domain`
 - `userId`
 - `userCapObjectId`
+- `claimTxDigest`
 - `claimedAt`
 
 ## Reset Behavior
@@ -622,12 +710,15 @@ When biometric enrollment changes and the Android Keystore key is invalidated:
 4. if confirmed, Granite Lake clears:
    - secure storage state
    - local capture artifacts
-   - SQLite captures
+   - SQLite `photo_captures`
+   - SQLite `uploaded_files`
    - SQLite projects
    - SQLite employees
    - SQLite config
 
-The app then returns to onboarding.
+A separate user-initiated account-deletion flow (`deleteAccount()`) clears the same local state. Before wiping, it calls the backend `PATCH otp/<userId>/deactivate` endpoint best-effort so the server and the on-chain enabled flag stop listing the user as active; local deletion proceeds even when the device is offline or the call fails.
+
+After either flow, the router sends the user to `/local-data-init` (local data re-initialization) rather than onboarding.
 
 ## Current Security Properties
 
@@ -654,7 +745,11 @@ The strongest next steps would be:
 1. remove the brief pre-binding plaintext persistence window for the Sui private key
 2. move from wrapping an exportable Sui private key to signing with non-exportable hardware-backed key material
 3. add iOS secure storage / biometric gate support
-4. add server-side or operator-side verification tooling for attestation events
+
+## UI Features
+
+- dark-mode toggle on the welcome and profile screens (`toggleTheme`, `lib/core/widgets/theme_toggle_button.dart`)
+- save an attested photo to the device gallery from the capture detail screen (`Gal.putImage`)
 
 ## Development Setup
 
@@ -753,6 +848,7 @@ Useful validation commands:
 
 ```bash
 flutter analyze lib
+flutter test
 cd android && ./gradlew :app:assembleDebug
 ```
 

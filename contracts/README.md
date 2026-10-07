@@ -4,7 +4,7 @@ Granite Lake is a lightweight Sui-based photo and file attestation system.
 
 It allows:
 
-- a contract owner to register domains
+- a contract owner to register domains and rotate domain admins
 - a domain admin to authorize wallets and enable or disable them
 - enabled wallets to attest photos and uploaded files on-chain
 - public verification through Sui events
@@ -119,7 +119,10 @@ Required for:
 
 ```move
 add_domain()
+set_domain_admin()
 ```
+
+Has `store`, so ownership can be handed off to a new wallet through Sui's standard `public_transfer` without a bespoke transfer function.
 
 ---
 
@@ -184,11 +187,27 @@ UserAdded {
 
 Emitted when admin enables a user wallet.
 
+```move
+UserEnabled {
+    domain,
+    admin_wallet,
+    user_wallet
+}
+```
+
 ---
 
 ## UserDisabled
 
 Emitted when admin disables a user wallet.
+
+```move
+UserDisabled {
+    domain,
+    admin_wallet,
+    user_wallet
+}
+```
 
 ---
 
@@ -202,11 +221,14 @@ PhotoAttested {
     gps,
     altitude,
     project_id,
-    user_wallet
+    user_wallet,
+    domain
 }
 ```
 
 This is the primary verification source for photo attestations.
+
+The `domain` field carries attribution so verifiers can read it straight from the event instead of reconstructing it from whichever capability the attesting wallet currently holds.
 
 ---
 
@@ -219,11 +241,28 @@ FileAttested {
     file_hash,
     user_wallet,
     file_id,
-    project_id
+    project_id,
+    domain
 }
 ```
 
 This is the primary verification source for uploaded files.
+
+The `domain` field carries attribution so verifiers can read it straight from the event.
+
+---
+
+## DomainAdminChanged
+
+Emitted when the owner rotates a domain's admin wallet.
+
+```move
+DomainAdminChanged {
+    domain,
+    old_admin_wallet,
+    new_admin_wallet
+}
+```
 
 ---
 
@@ -241,6 +280,23 @@ add_domain(
 ```
 
 Registers a new domain.
+
+---
+
+## set_domain_admin
+
+Owner-only.
+
+```move
+set_domain_admin(
+    domain,
+    new_admin_wallet
+)
+```
+
+Rotates a domain's admin wallet.
+
+Gated on `OwnerCap` rather than the domain's current admin so a compromised or lost admin key can still be replaced.
 
 ---
 

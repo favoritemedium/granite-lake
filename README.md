@@ -22,9 +22,9 @@ Top-level folders and what they contain:
 
 - `app/`: Android-focused Flutter application for local wallet creation, biometric protection, photo capture, file upload, Sui attestation, and verification.
 - `server/`: Per-domain backend API (Fastify + Postgres) for OTP registration, domain user management, and Sui writes.
-- `contracts/`: Sui Move package for domain registration, user capabilities, enable/disable controls, and event-only photo and file attestation.
-- `verification_portal/`: Public verification portal (Vite + React + TypeScript) for querying attested photos or uploaded files from Sui.
-- `verification_api/`: HTTP API backend for photo and file verification against on-chain attestations with DNS TXT consensus lookup.
+- `contracts/`: Sui Move package for domain registration, user capabilities, enable/disable controls, event-only photo and file attestation, and admin rotation via `set_domain_admin` (gated on the transferable `OwnerCap` and audited through `DomainAdminChanged` events).
+- `verification_portal/`: Public verification portal (Vite + React + TypeScript) for querying attested photos or uploaded files from Sui and auditing a wallet's attestation history in-browser.
+- `verification_api/`: HTTP API backend for photo and file verification and wallet attestation history against on-chain attestations with DNS TXT consensus lookup.
 
 Folder-specific documentation:
 
@@ -34,9 +34,22 @@ Folder-specific documentation:
 - `verification_portal/README.md`
 - `verification_api/README.md`
 
+Design documents at the repo root:
+
+- `granite-lake-app-auth-design.md`: app/API authentication design for the OTP and UTC routes
+- `granite-lake-file-upload-design.md`: file upload and attestation design
+- `granite-lake-offline-capture-design.md`: offline capture and on-chain timestamp design (high level)
+- `granite-lake-offline-capture-design-detail.md`: offline capture and on-chain timestamp design (detailed companion)
+
 ## Local Development
 
 Run Granite Lake locally with the API stack and Flutter app.
+
+Prerequisites:
+
+- Node.js >= 22 — declared by `server/` and `verification_api/` in `engines.node`, and the version CI runs
+- Flutter SDK — required for `app/`
+- Docker — required for the server stack
 
 ### 1) Install root tooling
 
@@ -57,26 +70,33 @@ docker compose --env-file .env up --build -d
 
 This starts:
 
+- A one-shot migration container that applies the database schema and exits
 - API at `http://localhost:8080`
 - Postgres for OTP sessions and registered users
 
 Before using OTP verification, make sure the configured domain and admin wallet already exist in the deployed Sui registry. The server can read `SUI_PRIVATE_KEY` directly from `.env`, or from HashiCorp Vault when Vault is enabled. See `server/README.md` for the required environment variables, Vault setup, and deployment model.
+
+`ADMIN_API_KEY` and `APP_API_KEY` are required in `.env`: `ADMIN_API_KEY` protects the operator-only `/admin/*` routes, and `APP_API_KEY` gates the app-facing `/otp/*` and `/utc` routes via the `x-app-api-key` header. The app must be built with an `apiKey` matching `APP_API_KEY` (see step 3). OTP codes are not emailed — the server posts them to the Google Chat webhook configured via `GOOGLE_CHAT_WEBHOOK_URL`, so set that in `.env` to receive OTPs locally.
 
 ### 3) Start Flutter app
 
 ```bash
 cd app
 flutter pub get
-flutter run --dart-define=GL_OTP_BACKEND_DEV_FALLBACKS=true
+flutter run --dart-define-from-file=secrets.json
 ```
 
-The app targets Android. For local development, pass `--dart-define=GL_OTP_BACKEND_DEV_FALLBACKS=true` to enable localhost fallback to `http://10.0.2.2:8080` (Android emulator) or `http://127.0.0.1:8080` (localhost).
+The app targets Android. It resolves the OTP/UTC backend per domain at build time: production builds require `GL_OTP_BACKEND_CONFIG`, a JSON object of `{"domain", "url", "apiKey"}`, and the resolver refuses to talk to any domain that is not configured. The recommended path for local development and production builds alike is a gitignored `app/secrets.json` passed via `--dart-define-from-file=secrets.json`:
 
-For convenience, you can create `app/.env.local` (add to `.gitignore`) with:
+```json
+{
+  "GL_OTP_BACKEND_CONFIG": "{\"domain\":\"acme.com\",\"url\":\"http://10.0.2.2:8080\",\"apiKey\":\"<APP_API_KEY from server/.env>\"}"
+}
+```
 
-```
-GL_OTP_BACKEND_DEV_FALLBACKS=true
-```
+`http://10.0.2.2:8080` reaches the host machine from the Android emulator; for a physical device, use the machine's LAN IP instead. `apiKey` must match the server's `APP_API_KEY`.
+
+Debug builds can alternatively enable localhost fallback probing with `--dart-define=GL_OTP_BACKEND_DEV_FALLBACKS=true` paired with `--dart-define=GL_OTP_BACKEND_DEV_API_KEY=<key matching the local server's APP_API_KEY>`, which probes `http://10.0.2.2:8080` (Android emulator) and `http://127.0.0.1:8080` (localhost). Each probe sends the `x-app-api-key` header against `GET /utc` and requires a 2xx response, so resolution fails with a 401 unless the dev API key matches `APP_API_KEY`. See `app/README.md` for the full backend configuration details.
 
 ### 4) Start verification API (optional)
 
@@ -87,7 +107,7 @@ npm install
 npm run dev
 ```
 
-The verification API runs at `http://localhost:8081` and provides a `/verify-attestation` endpoint for photo and file verification.
+The verification API runs at `http://localhost:8081` and provides a `/verify-attestation` endpoint for photo and file verification, plus a `GET /wallet-attestations/:wallet` endpoint for a wallet's on-chain attestation history (filter with `attest_type=photo` or `attest_type=file`; `attest_photo`/`attest_file` are accepted aliases; omit for all).
 
 ### 5) Start verification portal (optional)
 
@@ -97,7 +117,7 @@ npm install
 npm run dev
 ```
 
-The verification portal runs at the Vite dev server URL and provides a web UI for public photo or file verification.
+The verification portal runs at the Vite dev server URL and provides a web UI for public photo or file verification and in-browser wallet attestation history.
 
 ### 6) Quick health check
 
@@ -161,8 +181,12 @@ npm run format
 
 The Git hooks run these checks automatically:
 
-- `pre-commit`: server/verification_api/verification_portal format/lint checks and Flutter format/analyze checks
+- `pre-commit`: repo-wide Prettier format checks (all `js/ts/json/md/yml/yaml` files, not just server code), server/verification_api/verification_portal lint checks, and Flutter format/analyze checks
 - `pre-push`: pre-commit checks plus server build, server tests, contracts Move tests, verification_api build, and verification_portal build
+
+The contracts Move tests (`npm run test:contracts`) require the Sui CLI on `PATH`; CI installs it explicitly for its Move test job.
+
+CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main` with six jobs: lint-and-format, test-server, build-verification-api, build-verification-portal, flutter-analyze, and move-test.
 
 ### Server Checks
 
@@ -178,7 +202,7 @@ npm run lint:app
 npm run format:app:check
 ```
 
-`lint:app` runs `flutter analyze app`. Flutter tests can be added to the root scripts once the app has test files.
+`lint:app` runs `flutter analyze app`. Flutter tests live in `app/test/` (for example `app/test/core/services/valid_during_bcs_test.dart`) and run with `flutter test` from the `app/` directory; they are not yet wired into the root scripts.
 
 ### Verification Checks
 
@@ -195,7 +219,7 @@ At a high level:
 
 1. Publish or use the configured Granite Lake Move package.
 2. Register a domain with its admin wallet in the shared registry.
-3. Configure the server with matching `DOMAIN`, `ADMIN_WALLET`, `SUI_PRIVATE_KEY`, `SUI_PACKAGE_ID`, and `SUI_REGISTRY_ID`. `SUI_PRIVATE_KEY` can be a literal env value when Vault is disabled, or a `vault://` reference when Vault is enabled.
+3. Configure the server with matching `DOMAIN`, `ADMIN_WALLET`, `SUI_PRIVATE_KEY`, `SUI_PACKAGE_ID`, and `SUI_REGISTRY_ID`, plus the `ADMIN_API_KEY` (operator-only admin routes) and `APP_API_KEY` (app-facing OTP and UTC routes) credentials. The `apiKey` embedded in the app's `GL_OTP_BACKEND_CONFIG` must match the server's `APP_API_KEY`. `SUI_PRIVATE_KEY` can be a literal env value when Vault is disabled, or a `vault://` reference when Vault is enabled.
 4. Publish a DNS TXT record at `_attest.<domain>` so `verification_api` and `verification_portal` can each confirm the domain's attester wallet out-of-band from the chain. The record value must be `;`-separated `key=value` pairs including `chain_id`, `attester`, and `revoked`, for example:
 
    ```text
@@ -223,7 +247,7 @@ At a high level:
 
    Without DNSSEC enabled, the `_attest.<domain>` TXT lookup still works, but `dnssecValidated` reports `null`/`false` instead of `true`. See `verification_api/README.md` for how `dnssecValidated` is computed.
 
-6. Run OTP registration from the app.
+6. Run OTP registration from the app. The server posts each OTP to its configured Google Chat webhook (`GOOGLE_CHAT_WEBHOOK_URL`).
 7. Capture and attest photos from an enabled wallet.
 
 See:
@@ -233,7 +257,6 @@ See:
 - `app/README.md` for app storage, onboarding, and photo/file attestation flow
 - `verification_api/README.md` for the server-side DNS TXT consensus lookup and DNSSEC validation details
 - `verification_portal/README.md` for the client-side (in-browser) DNS TXT consensus lookup
-- `verification_api/README.md` for DNS TXT consensus lookup and DNSSEC validation details
 
 ## License
 
