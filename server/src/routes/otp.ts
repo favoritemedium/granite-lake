@@ -1,7 +1,13 @@
 import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import { env } from "../config/env.js";
-import { completeOtpSession, createOtpSession, disableUser, findOtpSession } from "../db/repositories.js";
+import {
+  completeOtpSession,
+  createDeactivationChallenge,
+  createOtpSession,
+  disableUserWithSignature,
+  findOtpSession,
+} from "../db/repositories.js";
 import { VaultConnectionError } from "../services/VaultService.js";
 import { requireAppApiKey } from "../utils/auth.js";
 import { RateLimiter, otpRequestLimiter, otpVerifyLimiter, resetAllRateLimiters } from "../utils/rateLimit.js";
@@ -19,6 +25,10 @@ const otpVerifySchema = z.object({
   otp: z.string().min(1),
   domain: z.string().min(1),
   userWallet: z.string().min(1),
+  userWalletSignature: z.string().min(1),
+});
+
+const deactivateSchema = z.object({
   userWalletSignature: z.string().min(1),
 });
 
@@ -151,17 +161,70 @@ export const otpRoutes: FastifyPluginAsync = async (app) => {
 
   // Self-service account deletion: when a user deletes the app's local
   // copy of their account, nothing previously told the server, so it and
-  // the chain kept listing them as active indefinitely. Gated by the same
-  // app API key as every other route here — consistent with /otp/verify
-  // already trusting that key to complete a registration for any userId,
-  // this trusts it to disable one. userId is an unguessable random UUID,
-  // never listed by any unauthenticated endpoint.
+  // the chain kept listing them as active indefinitely. The app API key
+  // alone used to authorize this, but that static key is extractable from
+  // any app build and never proved the request came from the account
+  // owner, so deactivation now follows a challenge-response: the wallet
+  // registered to the account must sign a short-lived, single-use
+  // server-issued nonce before anything is disabled.
+  app.post("/otp/:userId/deactivate/challenge", async (request, reply) => {
+    const userId = z
+      .string()
+      .min(1)
+      .parse((request.params as { userId: string }).userId);
+    const challenge = await createDeactivationChallenge(userId);
+
+    if (!challenge) {
+      return reply.status(404).send({
+        error: "not_found",
+        message: "No user found.",
+      });
+    }
+
+    return reply.status(201).send({
+      userId: challenge.userId,
+      nonce: challenge.nonce,
+      expiresAt: challenge.expiresAt,
+    });
+  });
+
   app.patch("/otp/:userId/deactivate", async (request, reply) => {
     const userId = z
       .string()
       .min(1)
       .parse((request.params as { userId: string }).userId);
-    const user = await disableUser(userId);
+    const parsedBody = deactivateSchema.safeParse(parseJsonStringBody(request.body));
+
+    if (!parsedBody.success) {
+      return reply.status(400).send({
+        error: "invalid_request",
+        message: "Request body must be a JSON object with userWalletSignature.",
+      });
+    }
+
+    let user;
+
+    try {
+      user = await disableUserWithSignature({
+        userId,
+        userWalletSignature: parsedBody.data.userWalletSignature,
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (error.message === "No deactivation challenge found." ||
+          error.message === "Deactivation challenge expired." ||
+          error.message === "Deactivation challenge already used." ||
+          error.message === "userWalletSignature does not match the registered wallet.")
+      ) {
+        return reply.status(401).send({
+          error: "invalid_signature",
+          message: error.message,
+        });
+      }
+
+      throw error;
+    }
 
     if (!user) {
       return reply.status(404).send({

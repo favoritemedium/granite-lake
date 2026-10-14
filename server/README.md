@@ -85,7 +85,7 @@ OTP codes are currently posted to a Google Chat incoming webhook using `GOOGLE_C
 
 ## App Authentication
 
-`APP_API_KEY` gates `/otp/request`, `/otp/verify`, `/otp/:userId`, `PATCH /otp/:userId/deactivate`, and `/utc` via an `x-app-api-key` header. It is separate from `ADMIN_API_KEY`, which protects the operator-only `/admin/*` routes. `/health` stays public and requires no credential, so deployment/uptime checks keep working.
+`APP_API_KEY` gates `/otp/request`, `/otp/verify`, `/otp/:userId`, `POST /otp/:userId/deactivate/challenge`, `PATCH /otp/:userId/deactivate`, and `/utc` via an `x-app-api-key` header. It is separate from `ADMIN_API_KEY`, which protects the operator-only `/admin/*` routes. `/health` stays public and requires no credential, so deployment/uptime checks keep working.
 
 Requests missing the header, or sending the wrong value, get a `401`:
 
@@ -199,7 +199,7 @@ Admin routes require:
 x-admin-api-key: <ADMIN_API_KEY>
 ```
 
-Only `GET /health` is public. Every `/otp/*` route, including `PATCH /otp/:userId/deactivate`, and `GET /utc` require the `x-app-api-key` header — see [App Authentication](#app-authentication).
+Only `GET /health` is public. Every `/otp/*` route, including `POST /otp/:userId/deactivate/challenge` and `PATCH /otp/:userId/deactivate`, and `GET /utc` require the `x-app-api-key` header — see [App Authentication](#app-authentication).
 
 ## API Reference
 
@@ -413,14 +413,53 @@ Errors:
 
 Any other failure — including an email that already has a `users` row by the time verification runs — has no dedicated mapping here and surfaces as `500 internal_error`; see [Error Handling](#error-handling).
 
-### `PATCH /otp/:userId/deactivate`
+### `POST /otp/:userId/deactivate/challenge`
 
-Self-service deactivation: submits on-chain `disable_user`, then marks the user as disabled in Postgres. Called by the app when a user deletes their local account, so the server and chain stop listing them as active. Gated by `x-app-api-key`, the same as every other `/otp/*` route — not `x-admin-api-key`. See [App Authentication](#app-authentication) for what that credential does and does not prove.
+Step 1 of self-service deactivation: issues the single-use nonce the account's registered wallet must sign before `PATCH /otp/:userId/deactivate` disables anything. Each call replaces any previous challenge for the user; the nonce is valid for 5 minutes. Gated by `x-app-api-key`, the same as every other `/otp/*` route — not `x-admin-api-key`.
 
 Headers:
 
 ```http
 x-app-api-key: <APP_API_KEY>
+```
+
+Response:
+
+```json
+{
+  "userId": "3cb8c8a1-69da-4efe-8a78-4d51cfc2df48",
+  "nonce": "<32 random bytes, base64>",
+  "expiresAt": "2026-10-14T12:05:00.000Z"
+}
+```
+
+When `userId` has no `users` row, the response is `404`:
+
+```json
+{
+  "error": "not_found",
+  "message": "No user found."
+}
+```
+
+### `PATCH /otp/:userId/deactivate`
+
+Step 2 of self-service deactivation: verifies the wallet signature, consumes the nonce, then submits on-chain `disable_user` and marks the user as disabled in Postgres. Called by the app when a user deletes their local account, so the server and chain stop listing them as active.
+
+The app API key alone is not enough here: it is a static key extractable from any app build and never proved the request came from the account owner. The request must instead carry a Sui personal-message signature of the UTF-8 bytes of `deactivate:<userId>:<nonce>`, produced by the wallet registered to the user for a nonce from the challenge route above. The nonce is single-use — replaying the same signature fails — and expires after 5 minutes. If the user is already disabled, the possession proof still runs but no second on-chain `disable_user` is submitted.
+
+Headers:
+
+```http
+x-app-api-key: <APP_API_KEY>
+```
+
+Request body:
+
+```json
+{
+  "userWalletSignature": "<base64 SuiPersonalMessageSignature>"
+}
 ```
 
 Success:
@@ -447,7 +486,27 @@ Success:
 }
 ```
 
-`user` is the full user record, the same shape `GET /admin/users` returns. When `userId` has no `users` row, the response is `404`:
+`user` is the full user record, the same shape `GET /admin/users` returns.
+
+A missing or malformed body returns `400`:
+
+```json
+{
+  "error": "invalid_request",
+  "message": "Request body must be a JSON object with userWalletSignature."
+}
+```
+
+A missing, expired, or already-used challenge, or a signature that does not verify against the registered wallet, returns `401`:
+
+```json
+{
+  "error": "invalid_signature",
+  "message": "userWalletSignature does not match the registered wallet."
+}
+```
+
+When `userId` has no `users` row, the response is `404`:
 
 ```json
 {
@@ -651,7 +710,7 @@ The Sui domain-admin calls (`add_user`, `disable_user`, `enable_user`) are attem
 
 ## Account Deletion and Re-registration
 
-Deleting a user's local app data (or an admin disabling them via `PATCH /admin/users/:userId/disable`) sets their `users` row to `status = 'disabled'`. It does not delete the row, and it does not free their `user_email` for a new registration — `POST /otp/request` rejects an email that already has a `users` row, active or disabled, with a `409 user_email_exists`. `POST /otp/verify` enforces the same rule — the session is marked `expired` and the request fails — but that error is currently not mapped to a dedicated response, so it surfaces as the generic `500 internal_error` from the global error handler rather than `user_email_exists`.
+Deleting a user's local app data (or an admin disabling them via `PATCH /admin/users/:userId/disable`) sets their `users` row to `status = 'disabled'`. The self-service path now requires the account's registered wallet to sign a server-issued nonce — see `POST /otp/:userId/deactivate/challenge` and `PATCH /otp/:userId/deactivate` — so holding the app API key alone is no longer enough to disable someone else's account; the admin path is unchanged. It does not delete the row, and it does not free their `user_email` for a new registration — `POST /otp/request` rejects an email that already has a `users` row, active or disabled, with a `409 user_email_exists`. `POST /otp/verify` enforces the same rule — the session is marked `expired` and the request fails — but that error is currently not mapped to a dedicated response, so it surfaces as the generic `500 internal_error` from the global error handler rather than `user_email_exists`.
 
 This is intentional, not an oversight. The only thing standing between "anyone who can receive an OTP at this email" and "a working on-chain identity for this domain" is possession of the inbox. That is an acceptable bar for _creating_ an identity, because it is bounded: it can only mint one capability per email, once. It is not an acceptable bar for _restoring one that was disabled_, because disabling is meant to be a deliberate act — the account holder choosing to delete their own device, or a domain admin responding to something (offboarding, a lost or compromised device, a policy violation). Letting the same low-friction, self-service OTP flow silently reverse that decision — no admin involved, no record of why the original disable happened — would mean disabling a user never actually revokes anything durably: anyone who still receives that address's mail could immediately reopen the identity on a new device. That collapses `disable` from an admin-controlled trust boundary into a formality.
 

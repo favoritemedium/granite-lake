@@ -31,11 +31,14 @@ const createOtpSession = vi.fn(async (input) => ({
 }));
 
 const completeOtpSession = vi.fn();
+const createDeactivationChallenge = vi.fn();
+const disableUserWithSignature = vi.fn();
 
 vi.mock("../src/db/repositories.js", () => ({
   completeOtpSession,
+  createDeactivationChallenge,
   createOtpSession,
-  disableUser: vi.fn(),
+  disableUserWithSignature,
   enableUser: vi.fn(),
   findOtpSession: vi.fn(),
   listUsers: vi.fn(async () => []),
@@ -367,9 +370,36 @@ describe("otp routes", () => {
     await app.close();
   });
 
-  it("deactivates a user's own account with the app API key", async () => {
-    const { disableUser } = await import("../src/db/repositories.js");
-    vi.mocked(disableUser).mockResolvedValueOnce({
+  it("issues a deactivation challenge for an existing user", async () => {
+    const { createDeactivationChallenge } = await import("../src/db/repositories.js");
+    vi.mocked(createDeactivationChallenge).mockResolvedValueOnce({
+      userId: "user-id-1",
+      nonce: "challenge-nonce",
+      expiresAt: "2026-10-14T12:00:00.000Z",
+    });
+
+    const app = await buildApp();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/otp/user-id-1/deactivate/challenge",
+      headers: APP_API_KEY_HEADERS,
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(createDeactivationChallenge).toHaveBeenCalledWith("user-id-1");
+    expect(response.json()).toEqual({
+      userId: "user-id-1",
+      nonce: "challenge-nonce",
+      expiresAt: "2026-10-14T12:00:00.000Z",
+    });
+
+    await app.close();
+  });
+
+  it("deactivates a user's own account with a wallet signature", async () => {
+    const { disableUserWithSignature } = await import("../src/db/repositories.js");
+    vi.mocked(disableUserWithSignature).mockResolvedValueOnce({
       userId: "user-id-1",
       domain: "acme.com",
       userEmail: "alice@acme.com",
@@ -392,10 +422,14 @@ describe("otp routes", () => {
       method: "PATCH",
       url: "/otp/user-id-1/deactivate",
       headers: APP_API_KEY_HEADERS,
+      payload: { userWalletSignature: "wallet-signature" },
     });
 
     expect(response.statusCode).toBe(200);
-    expect(disableUser).toHaveBeenCalledWith("user-id-1");
+    expect(disableUserWithSignature).toHaveBeenCalledWith({
+      userId: "user-id-1",
+      userWalletSignature: "wallet-signature",
+    });
     expect(response.json()).toMatchObject({
       message: "User disabled successfully.",
       user: { userId: "user-id-1", status: "disabled" },
@@ -410,6 +444,7 @@ describe("otp routes", () => {
     const response = await app.inject({
       method: "PATCH",
       url: "/otp/user-id-1/deactivate",
+      payload: { userWalletSignature: "wallet-signature" },
     });
 
     expect(response.statusCode).toBe(401);
@@ -417,19 +452,72 @@ describe("otp routes", () => {
     await app.close();
   });
 
-  it("returns 404 deactivating an unknown account", async () => {
-    const { disableUser } = await import("../src/db/repositories.js");
-    vi.mocked(disableUser).mockResolvedValueOnce(null);
+  it("rejects account deactivation without a wallet signature", async () => {
+    const { disableUserWithSignature } = await import("../src/db/repositories.js");
 
     const app = await buildApp();
 
     const response = await app.inject({
       method: "PATCH",
-      url: "/otp/missing-user/deactivate",
+      url: "/otp/user-id-1/deactivate",
       headers: APP_API_KEY_HEADERS,
     });
 
-    expect(response.statusCode).toBe(404);
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({
+      error: "invalid_request",
+      message: "Request body must be a JSON object with userWalletSignature.",
+    });
+    expect(disableUserWithSignature).not.toHaveBeenCalled();
+
+    await app.close();
+  });
+
+  it("rejects account deactivation with an invalid wallet signature", async () => {
+    const { disableUserWithSignature } = await import("../src/db/repositories.js");
+    vi.mocked(disableUserWithSignature).mockRejectedValueOnce(
+      new Error("userWalletSignature does not match the registered wallet.")
+    );
+
+    const app = await buildApp();
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/otp/user-id-1/deactivate",
+      headers: APP_API_KEY_HEADERS,
+      payload: { userWalletSignature: "not-a-valid-signature" },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({
+      error: "invalid_signature",
+      message: "userWalletSignature does not match the registered wallet.",
+    });
+
+    await app.close();
+  });
+
+  it("returns 404 deactivating an unknown account", async () => {
+    const { createDeactivationChallenge, disableUserWithSignature } = await import("../src/db/repositories.js");
+    vi.mocked(createDeactivationChallenge).mockResolvedValueOnce(null);
+    vi.mocked(disableUserWithSignature).mockResolvedValueOnce(null);
+
+    const app = await buildApp();
+
+    const challengeResponse = await app.inject({
+      method: "POST",
+      url: "/otp/missing-user/deactivate/challenge",
+      headers: APP_API_KEY_HEADERS,
+    });
+    const deactivateResponse = await app.inject({
+      method: "PATCH",
+      url: "/otp/missing-user/deactivate",
+      headers: APP_API_KEY_HEADERS,
+      payload: { userWalletSignature: "wallet-signature" },
+    });
+
+    expect(challengeResponse.statusCode).toBe(404);
+    expect(deactivateResponse.statusCode).toBe(404);
 
     await app.close();
   });
