@@ -328,11 +328,24 @@ class _ProfileScreenState extends State<ProfileScreen> {
     }
 
     setState(() => _isDeletingAccount = true);
-    await controller.deleteAccount();
+    final result = await controller.deleteAccount();
     if (!mounted) {
       return;
     }
     setState(() => _isDeletingAccount = false);
+
+    if (!result.isSuccess) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            result.message ?? 'Account deletion failed. Please try again.',
+          ),
+          backgroundColor: AppColors.statusError,
+        ),
+      );
+      return;
+    }
+
     GoRouter.of(context).go(AppRoutes.welcome);
   }
 }

@@ -28,6 +28,12 @@ export type OtpSessionRecord = {
   error: string | null;
 };
 
+export type DeactivationChallengeRecord = {
+  userId: string;
+  nonce: string;
+  expiresAt: string;
+};
+
 export type UserRecord = {
   userId: string;
   domain: string;
@@ -312,6 +318,107 @@ export async function disableUser(userId: string): Promise<UserRecord | null> {
   );
 
   return result.rows[0] ? withConfiguredUserFields(result.rows[0]) : null;
+}
+
+// How long a deactivation nonce stays valid once issued.
+const DEACTIVATION_NONCE_TTL_MS = 5 * 60 * 1000;
+
+// Issues the single-use nonce the account's registered wallet must sign
+// before disableUserWithSignature disables anything. Each call replaces any
+// previous challenge for the user. Returns null when the user doesn't exist.
+export async function createDeactivationChallenge(userId: string): Promise<DeactivationChallengeRecord | null> {
+  const nonce = randomBytes(32).toString("base64");
+  const expiresAt = new Date(Date.now() + DEACTIVATION_NONCE_TTL_MS).toISOString();
+
+  const result = await pool.query<{ userId: string }>(
+    `
+      update users
+      set deactivate_nonce = $2,
+          deactivate_nonce_expires_at = $3,
+          updated_at = now()
+      where user_id = $1
+      returning user_id as "userId"
+    `,
+    [userId, nonce, expiresAt]
+  );
+
+  return result.rows[0] ? { userId, nonce, expiresAt } : null;
+}
+
+// Self-service counterpart of disableUser: disables the user only after the
+// registered wallet signs deactivate:<userId>:<nonce> over a challenge from
+// createDeactivationChallenge. Returns null when the user doesn't exist;
+// throws for every challenge/signature failure so the route can map each to
+// 401 invalid_signature.
+export async function disableUserWithSignature(input: {
+  userId: string;
+  userWalletSignature: string;
+}): Promise<UserRecord | null> {
+  const result = await pool.query<{
+    userWallet: string;
+    status: UserRecord["status"];
+    deactivateNonce: string | null;
+    deactivateNonceExpiresAt: string | null;
+  }>(
+    `
+      select
+        user_wallet as "userWallet",
+        status,
+        deactivate_nonce as "deactivateNonce",
+        deactivate_nonce_expires_at as "deactivateNonceExpiresAt"
+      from users
+      where user_id = $1
+    `,
+    [input.userId]
+  );
+
+  const user = result.rows[0];
+
+  if (!user) {
+    return null;
+  }
+
+  if (!user.deactivateNonce || !user.deactivateNonceExpiresAt) {
+    throw new Error("No deactivation challenge found.");
+  }
+
+  if (Date.now() > Date.parse(user.deactivateNonceExpiresAt)) {
+    throw new Error("Deactivation challenge expired.");
+  }
+
+  await assertDeactivationWalletSignature({
+    userId: input.userId,
+    nonce: user.deactivateNonce,
+    userWallet: user.userWallet,
+    signature: input.userWalletSignature,
+  });
+
+  // Single-use: consume the nonce only while it is still the one just
+  // verified, so a replay of the same signature fails instead of disabling
+  // again.
+  const consumed = await pool.query(
+    `
+      update users
+      set deactivate_nonce = null,
+          deactivate_nonce_expires_at = null,
+          updated_at = now()
+      where user_id = $1
+        and deactivate_nonce = $2
+    `,
+    [input.userId, user.deactivateNonce]
+  );
+
+  if (!consumed.rowCount) {
+    throw new Error("Deactivation challenge already used.");
+  }
+
+  // Already disabled (e.g. by an admin): possession is proven and the nonce
+  // consumed, so report the record without a second on-chain disable call.
+  if (user.status === "disabled") {
+    return findUser(input.userId);
+  }
+
+  return disableUser(input.userId);
 }
 
 export async function enableUser(userId: string): Promise<UserRecord | null> {
@@ -617,6 +724,29 @@ async function assertWalletSignature(params: {
     });
   } catch {
     throw new Error("userWallet does not match the OTP session.");
+  }
+}
+
+// Binds self-service deactivation to the account owner: the registered
+// wallet must sign deactivate:<userId>:<nonce> for a challenge this server
+// issued. The wallet exists on chain, but nothing on chain can prove key
+// possession, so the server-issued nonce carries that weight.
+async function assertDeactivationWalletSignature(params: {
+  userId: string;
+  nonce: string;
+  userWallet: string;
+  signature: string;
+}): Promise<void> {
+  try {
+    await verifyPersonalMessageSignature(
+      Buffer.from(`deactivate:${params.userId}:${params.nonce}`, "utf8"),
+      params.signature,
+      {
+        address: params.userWallet,
+      }
+    );
+  } catch {
+    throw new Error("userWalletSignature does not match the registered wallet.");
   }
 }
 
