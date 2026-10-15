@@ -241,10 +241,20 @@ class GraniteLakeController extends ChangeNotifier {
       );
     }
 
+    // The OTP request binds the device wallet to the session server-side,
+    // so the identity has to exist before the OTP is requested.
+    final identity = _identity;
+    if (identity == null) {
+      return const SecureOperationResult.failure(
+        'Create the local Sui identity before requesting an OTP.',
+      );
+    }
+
     try {
       final result = await _photoAttestationService.requestUserOtp(
         domain: normalizedDomain,
         userEmail: normalizedUserEmail,
+        walletAddress: identity.walletAddress,
       );
       return SecureOperationResult.success(result);
     } on PhotoAttestationException catch (error) {

@@ -144,6 +144,7 @@ beforeEach(() => {
 describe("completeOtpSession wallet signature check (F-03)", () => {
   it("accepts a real signature over the session nonce from the claimed wallet", async () => {
     const keypair = new Ed25519Keypair();
+    currentSession = pendingSession({ userWallet: keypair.toSuiAddress() });
     const { signature } = await keypair.signPersonalMessage(Buffer.from(NONCE, "base64"));
 
     const result = await completeOtpSession({
@@ -161,9 +162,29 @@ describe("completeOtpSession wallet signature check (F-03)", () => {
     });
   });
 
+  it("rejects a wallet that differs from the one bound to the session at OTP request", async () => {
+    const sessionWallet = new Ed25519Keypair().toSuiAddress();
+    const claimer = new Ed25519Keypair();
+    currentSession = pendingSession({ userWallet: sessionWallet });
+    const { signature } = await claimer.signPersonalMessage(Buffer.from(NONCE, "base64"));
+
+    await expect(
+      completeOtpSession({
+        userId: "user-id-1",
+        domain: "acme.com",
+        otp: OTP,
+        userWallet: claimer.toSuiAddress(),
+        userWalletSignature: signature,
+      })
+    ).rejects.toThrow("userWallet does not match the OTP session.");
+
+    expect(addUserMock).not.toHaveBeenCalled();
+  });
+
   it("rejects a valid signature that does not match the claimed wallet address", async () => {
     const signer = new Ed25519Keypair();
     const claimedWallet = new Ed25519Keypair().toSuiAddress(); // different wallet than the signer
+    currentSession = pendingSession({ userWallet: claimedWallet });
     const { signature } = await signer.signPersonalMessage(Buffer.from(NONCE, "base64"));
 
     await expect(
@@ -181,6 +202,7 @@ describe("completeOtpSession wallet signature check (F-03)", () => {
 
   it("rejects a valid signature produced over a different session's nonce", async () => {
     const keypair = new Ed25519Keypair();
+    currentSession = pendingSession({ userWallet: keypair.toSuiAddress() });
     const otherNonce = Buffer.from("a-completely-different-nonce!!!!").toString("base64");
     const { signature } = await keypair.signPersonalMessage(Buffer.from(otherNonce, "base64"));
 
@@ -199,6 +221,7 @@ describe("completeOtpSession wallet signature check (F-03)", () => {
 
   it("rejects a malformed signature string", async () => {
     const keypair = new Ed25519Keypair();
+    currentSession = pendingSession({ userWallet: keypair.toSuiAddress() });
 
     await expect(
       completeOtpSession({
@@ -214,8 +237,26 @@ describe("completeOtpSession wallet signature check (F-03)", () => {
   });
 
   it("rejects when the session predates the wallet_nonce column (null nonce)", async () => {
-    currentSession = pendingSession({ walletNonce: null });
     const keypair = new Ed25519Keypair();
+    currentSession = pendingSession({ userWallet: keypair.toSuiAddress(), walletNonce: null });
+    const { signature } = await keypair.signPersonalMessage(Buffer.from(NONCE, "base64"));
+
+    await expect(
+      completeOtpSession({
+        userId: "user-id-1",
+        domain: "acme.com",
+        otp: OTP,
+        userWallet: keypair.toSuiAddress(),
+        userWalletSignature: signature,
+      })
+    ).rejects.toThrow("userWallet does not match the OTP session.");
+
+    expect(addUserMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects when the session predates request-time wallet binding (null wallet)", async () => {
+    const keypair = new Ed25519Keypair();
+    currentSession = pendingSession({ userWallet: null });
     const { signature } = await keypair.signPersonalMessage(Buffer.from(NONCE, "base64"));
 
     await expect(

@@ -17,7 +17,7 @@ const createOtpSession = vi.fn(async (input) => ({
   userId: "user-id-1",
   domain: input.domain,
   userEmail: input.userEmail,
-  userWallet: null,
+  userWallet: input.userWallet,
   adminWallet: "0xabc",
   otpHash: "otp-hash",
   walletNonce: "test-nonce",
@@ -63,6 +63,7 @@ describe("otp routes", () => {
       payload: {
         domain: "acme.com",
         user_email: "alice@acme.com",
+        user_wallet: "0x1111111111111111111111111111111111111111111111111111111111111111",
       },
     });
 
@@ -112,6 +113,7 @@ describe("otp routes", () => {
       payload: {
         domain: "acme.com",
         user_email: "alice@acme.com",
+        user_wallet: "0x1111111111111111111111111111111111111111111111111111111111111111",
       },
     });
 
@@ -119,6 +121,7 @@ describe("otp routes", () => {
     expect(createOtpSession).toHaveBeenCalledWith({
       domain: "acme.com",
       userEmail: "alice@acme.com",
+      userWallet: "0x1111111111111111111111111111111111111111111111111111111111111111",
       ttlMs: 300000,
     });
     const body = response.json();
@@ -126,6 +129,7 @@ describe("otp routes", () => {
     expect(body).toHaveProperty("expiresAt");
     expect(body).toHaveProperty("domain", "acme.com");
     expect(body).toHaveProperty("userEmail", "alice@acme.com");
+    expect(body).toHaveProperty("userWallet", "0x1111111111111111111111111111111111111111111111111111111111111111");
     expect(body).not.toHaveProperty("otp");
 
     await app.close();
@@ -144,6 +148,7 @@ describe("otp routes", () => {
       payload: JSON.stringify({
         domain: "acme.com",
         user_email: "alice@acme.com",
+        user_wallet: "0x1111111111111111111111111111111111111111111111111111111111111111",
       }),
     });
 
@@ -151,6 +156,7 @@ describe("otp routes", () => {
     expect(createOtpSession).toHaveBeenCalledWith({
       domain: "acme.com",
       userEmail: "alice@acme.com",
+      userWallet: "0x1111111111111111111111111111111111111111111111111111111111111111",
       ttlMs: 300000,
     });
 
@@ -173,7 +179,7 @@ describe("otp routes", () => {
     expect(response.statusCode).toBe(400);
     expect(response.json()).toEqual({
       error: "invalid_request",
-      message: "Request body must be a JSON object with domain and user_email.",
+      message: "Request body must be a JSON object with domain, user_email, and user_wallet.",
     });
     expect(createOtpSession).not.toHaveBeenCalled();
 
@@ -190,6 +196,7 @@ describe("otp routes", () => {
       payload: {
         domain: "acme.com",
         user_email: "alice@example.com",
+        user_wallet: "0x1111111111111111111111111111111111111111111111111111111111111111",
       },
     });
 
@@ -215,6 +222,7 @@ describe("otp routes", () => {
       payload: {
         domain: "acme.com",
         user_email: "alice@acme.com",
+        user_wallet: "0x1111111111111111111111111111111111111111111111111111111111111111",
       },
     });
 
@@ -222,6 +230,54 @@ describe("otp routes", () => {
     expect(response.json()).toEqual({
       error: "user_email_exists",
       message: "User email alice@acme.com is already registered.",
+    });
+
+    await app.close();
+  });
+
+  it("rejects an OTP request without a wallet address", async () => {
+    const app = await buildApp();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/otp/request",
+      headers: APP_API_KEY_HEADERS,
+      payload: {
+        domain: "acme.com",
+        user_email: "alice@acme.com",
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({
+      error: "invalid_request",
+      message: "Request body must be a JSON object with domain, user_email, and user_wallet.",
+    });
+    expect(createOtpSession).not.toHaveBeenCalled();
+
+    await app.close();
+  });
+
+  it("rejects an OTP request with a wallet that is not a Sui address", async () => {
+    createOtpSession.mockRejectedValueOnce(new Error("userWallet must be a Sui address."));
+
+    const app = await buildApp();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/otp/request",
+      headers: APP_API_KEY_HEADERS,
+      payload: {
+        domain: "acme.com",
+        user_email: "alice@acme.com",
+        user_wallet: "not-a-sui-address",
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({
+      error: "invalid_wallet_address",
+      message: "userWallet must be a Sui address.",
     });
 
     await app.close();
@@ -571,6 +627,7 @@ describe("OTP rate limiting", () => {
         payload: {
           domain: "acme.com",
           user_email: `user${i}@acme.com`,
+          user_wallet: "0x1111111111111111111111111111111111111111111111111111111111111111",
         },
       });
       results.push(response.statusCode);
@@ -595,6 +652,7 @@ describe("OTP rate limiting", () => {
         payload: {
           domain: "acme.com",
           user_email: `user${i}@acme.com`,
+          user_wallet: "0x1111111111111111111111111111111111111111111111111111111111111111",
         },
       });
     }
@@ -607,6 +665,7 @@ describe("OTP rate limiting", () => {
       payload: {
         domain: "acme.com",
         user_email: "another@acme.com",
+        user_wallet: "0x1111111111111111111111111111111111111111111111111111111111111111",
       },
     });
 
