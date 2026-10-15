@@ -81,7 +81,7 @@ Postgres connection settings are optional at runtime: `POSTGRES_USER`, `POSTGRES
 
 ### OTP Delivery
 
-OTP codes are currently posted to a Google Chat incoming webhook using `GOOGLE_CHAT_WEBHOOK_URL`. This is a temporary delivery path until the paid email service is available. The API still requires `user_email` so it can validate the user belongs to the configured domain and record the verified user identity.
+OTP codes are currently posted to a Google Chat incoming webhook using `GOOGLE_CHAT_WEBHOOK_URL`. This is a temporary delivery path until the paid email service is available. The API still requires `user_email` so it can validate the user belongs to the configured domain and record the verified user identity, and `user_wallet` so the OTP session is bound to the wallet that will claim it. The Chat message includes the email, wallet address, code, and expiry.
 
 ## App Authentication
 
@@ -241,7 +241,7 @@ Response:
 
 ### `POST /otp/request`
 
-Creates an OTP session and posts the OTP details to the configured Google Chat webhook. This replaces email delivery for now, until the paid email service is enabled.
+Creates an OTP session and posts the OTP details (email, wallet, code) to the configured Google Chat webhook. This replaces email delivery for now, until the paid email service is enabled.
 
 Rules:
 
@@ -249,6 +249,7 @@ Rules:
 - `user_email` must be a valid email.
 - `user_email` domain must match env `DOMAIN`.
 - `user_email` must not already exist in the `users` table, **including disabled users** — see [Account Deletion and Re-registration](#account-deletion-and-re-registration).
+- `user_wallet` must be a Sui address. It is stored on the session (`otp_sessions.user_wallet`) and echoed back as `userWallet`; `POST /otp/verify` must later present this same address, so the session is bound to the wallet that started it.
 - A `user_email` can have only one pending session at a time. Pending sessions past their `expires_at` are flipped to `expired` before the insert, so re-requesting after the OTP expired works; while an unexpired pending session exists, a new request fails. That rejection currently has no dedicated mapping and surfaces as the generic `500 internal_error` — see [Error Handling](#error-handling).
 - The OTP is not returned by the API.
 
@@ -257,7 +258,8 @@ Request:
 ```json
 {
   "domain": "acme.com",
-  "user_email": "alice@acme.com"
+  "user_email": "alice@acme.com",
+  "user_wallet": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 }
 ```
 
@@ -269,11 +271,12 @@ Success `201`:
   "expiresAt": "2026-06-05T05:35:00.000Z",
   "domain": "acme.com",
   "userEmail": "alice@acme.com",
+  "userWallet": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "walletNonce": "KUB3CptWJYZe/qJBEX9G+sbToEPICRM9eGjZDfTL0GQ="
 }
 ```
 
-`walletNonce` is a one-time, server-issued nonce: the client base64-decodes it, signs the raw bytes as a Sui personal message with the private key of the wallet it will claim at `POST /otp/verify`, and submits that signature as `userWalletSignature` there.
+`walletNonce` is a one-time, server-issued nonce: the client base64-decodes it, signs the raw bytes as a Sui personal message with the private key of `userWallet` — the same wallet sent as `user_wallet` here — and submits that signature as `userWalletSignature` at `POST /otp/verify`.
 
 Possible errors:
 
@@ -281,6 +284,13 @@ Possible errors:
 {
   "error": "invalid_email_domain",
   "message": "user_email must belong to acme.com."
+}
+```
+
+```json
+{
+  "error": "invalid_wallet_address",
+  "message": "userWallet must be a Sui address."
 }
 ```
 
@@ -302,7 +312,7 @@ Response:
   "userId": "3cb8c8a1-69da-4efe-8a78-4d51cfc2df48",
   "domain": "acme.com",
   "userEmail": "alice@acme.com",
-  "userWallet": null,
+  "userWallet": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "adminWallet": "0x...",
   "txDigest": null,
   "userCapId": null,
@@ -335,6 +345,7 @@ Rules:
 - OTP must match.
 - `domain` must match env `DOMAIN`.
 - `userWallet` must be a Sui address.
+- `userWallet` must equal the wallet stored on the session at `POST /otp/request` (`user_wallet`). A different wallet — or a legacy session with no wallet bound — fails verification.
 - `userWalletSignature` must be a Sui personal-message signature over the raw bytes of the session's `walletNonce` (base64-decode the value returned by `POST /otp/request`), made with the private key of `userWallet`. The server verifies it against `userWallet` before minting — a mismatch, or a legacy session with no nonce, fails verification.
 - Sui `add_user` must succeed before the user is stored as active.
 
@@ -698,11 +709,11 @@ The database does not store `domain` or `admin_wallet`; those come from env beca
 
 ## Flow
 
-1. User requests an OTP with `domain` and `user_email`.
+1. User requests an OTP with `domain`, `user_email`, and `user_wallet`.
 2. Server validates the email domain and checks the email is not already registered.
-3. Server stores an OTP session (issuing a `walletNonce`) and posts the OTP to Google Chat.
+3. Server stores an OTP session, binding `user_wallet` to it and issuing a `walletNonce`, and posts the OTP (email, wallet, code) to Google Chat.
 4. User submits `userId`, `otp`, `domain`, `userWallet`, and `userWalletSignature` — a Sui personal-message signature over the session's `walletNonce`, proving control of `userWallet`'s private key.
-5. Server verifies the OTP and the wallet signature, then submits Sui `add_user`.
+5. Server verifies the OTP, that `userWallet` matches the wallet bound at request time, and the wallet signature, then submits Sui `add_user`.
 6. Server stores the user as `active`.
 7. Admin can call disable/enable endpoints, which also submit Sui transactions.
 

@@ -18,6 +18,7 @@ export { resetAllRateLimiters };
 const otpRequestSchema = z.object({
   domain: z.string().min(1),
   user_email: z.string().email(),
+  user_wallet: z.string().min(1),
 });
 
 const otpVerifySchema = z.object({
@@ -86,7 +87,7 @@ export const otpRoutes: FastifyPluginAsync = async (app) => {
     if (!parsedBody.success) {
       return reply.status(400).send({
         error: "invalid_request",
-        message: "Request body must be a JSON object with domain and user_email.",
+        message: "Request body must be a JSON object with domain, user_email, and user_wallet.",
       });
     }
 
@@ -105,12 +106,20 @@ export const otpRoutes: FastifyPluginAsync = async (app) => {
       session = await createOtpSession({
         domain: body.domain,
         userEmail: body.user_email,
+        userWallet: body.user_wallet,
         ttlMs: env.OTP_TTL_MS,
       });
     } catch (error) {
       if (error instanceof Error && error.message.includes("is already registered")) {
         return reply.status(409).send({
           error: "user_email_exists",
+          message: error.message,
+        });
+      }
+
+      if (error instanceof Error && error.message === "userWallet must be a Sui address.") {
+        return reply.status(400).send({
+          error: "invalid_wallet_address",
           message: error.message,
         });
       }
@@ -123,8 +132,10 @@ export const otpRoutes: FastifyPluginAsync = async (app) => {
       expiresAt: session.expiresAt,
       domain: session.domain,
       userEmail: session.userEmail,
-      // The wallet claimed at /otp/verify must sign this nonce to prove
-      // possession of its private key.
+      // The wallet claimed here is bound to the session: /otp/verify must
+      // present this same address and prove possession of its private key
+      // by signing the nonce below.
+      userWallet: session.userWallet,
       walletNonce: session.walletNonce,
     });
   });

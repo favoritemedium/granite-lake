@@ -119,10 +119,10 @@ The app currently uses these contract entry points:
 
 OTP and UserCap claim flow:
 
-- the app calls the backend `POST /otp/request` endpoint with the company domain and user email
-- the backend delivers the OTP through its configured delivery channel and returns `userId`, `expiresAt`, and a server-issued `walletNonce`
-- the app calls `POST /otp/verify` with `userId`, `otp`, `domain`, the device wallet address (`userWallet`), and `userWalletSignature` — an Ed25519 personal-message signature over the `walletNonce`, proving the caller controls the wallet's private key
-- the backend verifies the OTP and the wallet signature, then signs the contract `add_user` transaction with the configured domain-admin wallet
+- the app calls the backend `POST /otp/request` endpoint with the company domain, user email, and the device wallet address (`user_wallet`) — the backend binds that wallet to the OTP session
+- the backend delivers the OTP (including the wallet address) through its configured delivery channel and returns `userId`, `expiresAt`, `userWallet`, and a server-issued `walletNonce`
+- the app calls `POST /otp/verify` with `userId`, `otp`, `domain`, the same device wallet address (`userWallet`), and `userWalletSignature` — an Ed25519 personal-message signature over the `walletNonce`, proving the caller controls the wallet's private key; the backend rejects the request if `userWallet` differs from the wallet bound at request time
+- the backend verifies the OTP, the wallet match, and the wallet signature, then signs the contract `add_user` transaction with the configured domain-admin wallet
 - after success, the backend returns the transaction digest and `UserCap` object id
 - the app stores the successful claim record in SQLite and verifies that the `UserCap` resolves for the device wallet
 

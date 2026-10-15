@@ -12,6 +12,9 @@ export type OtpSessionRecord = {
   userId: string;
   domain: string;
   userEmail: string;
+  // Wallet claimed at /otp/request; /otp/verify must present the same
+  // address. Null only for sessions created before it was sent at request
+  // time, which fail verification.
   userWallet: string | null;
   adminWallet: string;
   otpHash: string;
@@ -54,12 +57,15 @@ export type UserRecord = {
 export async function createOtpSession(input: {
   domain: string;
   userEmail: string;
+  userWallet: string;
   ttlMs: number;
 }): Promise<OtpSessionRecord> {
   assertConfiguredDomain(input.domain);
   assertConfiguredEmailDomain(input.userEmail);
+  assertSuiAddress(input.userWallet, "userWallet");
 
   const userEmail = normalizeEmail(input.userEmail);
+  const userWallet = normalizeWallet(input.userWallet);
   const existingUser = await findUserByEmail(userEmail);
 
   if (existingUser) {
@@ -87,7 +93,7 @@ export async function createOtpSession(input: {
     userId,
     domain: configuredDomain(),
     userEmail,
-    userWallet: null,
+    userWallet,
     adminWallet: configuredAdminWallet(),
     otpHash: sha256(otp),
     walletNonce: randomBytes(32).toString("base64"),
@@ -137,6 +143,7 @@ export async function createOtpSession(input: {
     await googleChatService.sendOtp({
       userEmail: session.userEmail,
       userId: session.userId,
+      userWallet,
       otp,
       expiresAt: session.expiresAt,
     });
@@ -495,10 +502,16 @@ export async function completeOtpSession(input: {
 
   assertSuiAddress(input.userWallet, "userWallet");
 
-  // The caller supplies userWallet as a bare string with nothing binding it
-  // to the holder of that wallet's private key. Require a
-  // signature over this session's server-issued nonce, verified against the
-  // claimed address, before minting a capability for it.
+  // The wallet claimed at /otp/verify must be the same one bound to the
+  // session at /otp/request; anything else means the session is being
+  // completed for a wallet other than the one that started it.
+  if (!session.userWallet || normalizeWallet(session.userWallet) !== normalizeWallet(input.userWallet)) {
+    throw new Error("userWallet does not match the OTP session.");
+  }
+
+  // The wallet address alone proves nothing about key possession, so also
+  // require a signature over this session's server-issued nonce, verified
+  // against the claimed address, before minting a capability for it.
   await assertWalletSignature({
     userWallet: normalizeWallet(input.userWallet),
     nonce: session.walletNonce,
