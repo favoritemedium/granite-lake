@@ -22,3 +22,5 @@ coverage
 Pub.*.toml
 .codegraph
 .claude
+AGENTS.md
+**/secrets**
